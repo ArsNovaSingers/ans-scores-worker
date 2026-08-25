@@ -1,0 +1,7 @@
+Flask==3.0.3
+gunicorn==22.0.0
+google-auth==2.34.0
+google-api-python-client==2.143.0
+google-cloud-storage==2.18.2
+PyMuPDF==1.24.10
+Pillow==10.4.0
