@@ -15,7 +15,7 @@ certain returns a question for a human instead of an answer.
 import time
 import uuid
 
-from . import naming, store
+from . import fingerprint, naming, store
 
 # A name this close, in the same project folder, is worth ASKING about.
 # It is never enough to act on by itself.
@@ -140,10 +140,7 @@ def _ambiguous(works: list[dict], why: str) -> dict:
 
 def _structure_ok(inspected: dict, work: dict) -> bool:
     current = next(v for v in work["versions"] if v["n"] == work["current"])
-    return (
-        current["structure"]["page_count"] == inspected["page_count"]
-        and current["structure"]["page_dims"] == inspected["page_dims"]
-    )
+    return fingerprint.structure_matches(current["structure"], inspected)
 
 
 def stage(entry: dict) -> str:
@@ -191,21 +188,11 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
             raise ValueError("new_edition needs a work_id that exists")
         work = registry["works"][work_id]
         current = next(v for v in work["versions"] if v["n"] == work["current"])
-        same_structure = (
-            current["structure"]["page_count"] == item["inspected"]["page_count"]
-            and current["structure"]["page_dims"] == item["inspected"]["page_dims"]
-        )
-        if not same_structure and not accept_structure_change:
+        if not fingerprint.structure_matches(current["structure"], item["inspected"]) \
+                and not accept_structure_change:
             # Section 3.4. This is the one change that moves every singer's
             # markings, so it cannot happen as a side effect of pressing publish.
-            raise ValueError(
-                "page structure differs from the published version "
-                "({} pages now, {} before). Singers' markings will not line up. "
-                "Publish as a new piece, or repeat with accept_structure_change=true "
-                "and tell the choir.".format(
-                    item["inspected"]["page_count"], current["structure"]["page_count"]
-                )
-            )
+            raise ValueError(_structure_change_message(current["structure"], item["inspected"]))
         n = max(v["n"] for v in work["versions"]) + 1
 
     elif decision == "new_work":
@@ -288,6 +275,31 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
         "published_path": ppath,
         "version_path": vpath,
     }
+
+
+def _structure_change_message(published: dict, incoming: dict) -> str:
+    """
+    Say what moved, not that something moved. A person deciding whether to
+    override this needs to know it is one cropped page rather than a reformat.
+    """
+    was, now = published["page_count"], incoming["page_count"]
+    if was != now:
+        detail = "the page count changed from {} to {}".format(was, now)
+    else:
+        moved = fingerprint.dim_differences(published["page_dims"], incoming["page_dims"])
+        shown = ", ".join(
+            "page {} {}x{} to {}x{}".format(n, b[0], b[1], a[0], a[1])
+            for n, b, a in moved[:4]
+        )
+        if len(moved) > 4:
+            shown += " and {} more".format(len(moved) - 4)
+        detail = "{} of {} pages changed size ({})".format(len(moved), now, shown)
+    return (
+        "Refusing to replace the published version: {}. Singers' markings are "
+        "positioned per page and will not line up. Publish this as a new piece, "
+        "or repeat with accept_structure_change=true and tell the choir what "
+        "changed.".format(detail)
+    )
 
 
 def _assert_name_free(registry: dict, group: str, project: str, canonical: str) -> None:

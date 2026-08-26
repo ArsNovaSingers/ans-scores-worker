@@ -126,11 +126,50 @@ def inspect(path: str) -> dict:
     }
 
 
+# How far a page may move before we call it a real size change.
+#
+# Tuned against actual Ars Nova scans rather than guessed. Hand-scanned choral
+# PDFs are not dimensionally uniform - ANS-PureImagination_CS.pdf, scanned once
+# and never edited, has pages from 606x792 to 612x773. Exact equality would
+# therefore flag every re-scan of it as "your markings will not line up", and a
+# warning that fires on healthy files is worse than no warning: people learn to
+# click through the one gate that protects their annotations.
+#
+# The changes that DO matter are much larger. Letter to A4 moves the width 17pt
+# and the height 50pt; letter to legal moves the height 144pt. So the threshold
+# sits in the gap: 12 points, or 2% of the page for unusually large sheets,
+# whichever is greater.
+DIM_TOLERANCE_POINTS = 12
+DIM_TOLERANCE_RATIO = 0.02
+
+
+def _axis_moved(before: float, after: float) -> bool:
+    allowed = max(DIM_TOLERANCE_POINTS, abs(before) * DIM_TOLERANCE_RATIO)
+    return abs(before - after) > allowed
+
+
+def dim_differences(before: list, after: list) -> list:
+    """
+    Which pages actually changed size, as [(page_number, before, after)].
+
+    Returned rather than a bare boolean so the human being asked to decide can
+    be told "page 7 went from 792pt to 700pt" instead of "structure differs".
+    """
+    out = []
+    for page_no, (was, now) in enumerate(zip(before, after), start=1):
+        if _axis_moved(was[0], now[0]) or _axis_moved(was[1], now[1]):
+            out.append((page_no, list(was), list(now)))
+    return out
+
+
 def structure_matches(a: dict, b: dict) -> bool:
     """
-    True when two files agree on the things annotations depend on.
+    True when two files agree on the things annotations are positioned against.
 
-    Deliberately strict about dimensions: if page 4 changed size, markings on
-    page 4 will be wrong even though every other page is fine.
+    Page count is exact - a page added or removed shifts every marking after it,
+    and there is no tolerance that makes that acceptable. Page size is compared
+    with the tolerance above, because scan-to-scan jitter is not a layout change.
     """
-    return a.get("page_count") == b.get("page_count") and a.get("page_dims") == b.get("page_dims")
+    if a.get("page_count") != b.get("page_count"):
+        return False
+    return not dim_differences(a.get("page_dims") or [], b.get("page_dims") or [])
