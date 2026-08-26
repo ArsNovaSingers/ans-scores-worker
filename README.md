@@ -67,6 +67,9 @@ currently does and this service does not.
 | POST | `/verify` | R6 — every current version exists where it should |
 | GET | `/url` | short-lived signed read URL for one published score |
 | POST | `/propose-name` | what would this filename publish as |
+| POST | `/rollback` | put a previous version back on the published path |
+| GET | `/library/<group>` | the singer-facing view: what is published, by project |
+| POST | `/publish-batch` | decide several staged items in one call |
 
 ### Scanning
 
@@ -90,6 +93,32 @@ POST /publish  {"staging_id": "...", "decision": "new_edition",
 count or page dimensions differ from the published version is **refused** and
 says why; repeating with `accept_structure_change: true` is a deliberate act
 that comes with an obligation to tell the choir.
+
+### Rolling back
+
+```
+POST /rollback  {"work_id": "...", "to_version": 1, "actor": "jon@arsnovasingers.org"}
+```
+
+R3 promised that every version is kept and that a bad publish is recoverable.
+Until v0.2.0 nothing actually exercised that promise, which testing found and
+review did not. Rollback copies the chosen version's bytes back over the
+published path and moves `current`; it deletes nothing and renumbers nothing,
+so the version that was current stays where it is and a rollback can itself be
+rolled back. The published filename does not move — that is the point.
+
+### The singer-facing view
+
+```
+GET /library/chamber-singers
+```
+
+Returns what is published for a group, grouped by project: canonical name, page
+count, version number, when it last changed, and whether it has ever been
+revised. It is deliberately not the registry dump, and it knows nothing about
+who a singer is — WordPress calls this server-side and owns the question of who
+may see what. Keeping those two apart is what stops a second permission system
+growing here to disagree with the first one.
 
 ## Configuration
 
