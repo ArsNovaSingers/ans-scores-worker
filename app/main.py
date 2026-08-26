@@ -1,10 +1,16 @@
 """
 ans-scores-worker - HTTP surface.
 
-Phase 1 of claude/portal/Device_Sync_Spec.md. What exists here: the Drive walk,
-identity, staging, publishing under frozen names, the manifest, and
-verification. What does not exist yet, on purpose: optimisation (Phase 2),
-singer-facing delivery (Phase 3), WebDAV (Phase 5), quiet hours (Phase 6).
+claude/portal/Device_Sync_Spec.md. What exists here: the Drive walk, identity,
+staging, publishing under frozen names, versioning, rollback, and the
+group library the Hub renders from. What does not exist yet, on purpose:
+PDF optimisation and Tom's approval queue (Phase 2), WebDAV (Phase 5), and
+quiet hours (Phase 6).
+
+This service knows nothing about singers or permissions. /library answers
+"what is published for this group"; WordPress owns "who is in that group".
+Keeping those apart is what stops a second permission system growing here to
+disagree with the first one.
 
 Auth is a bearer token in the Authorization header, never a query parameter.
 The existing Ars Nova connector fleet uses ?key= and that writes the token
@@ -50,7 +56,7 @@ def _project_from_path(rel_path: list[str]) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "phase": 1})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.2.0"})
 
 
 @app.get("/whoami")
@@ -323,7 +329,72 @@ def url():
         return jsonify({"ok": False, "error": "only published scores can be linked"}), 400
     if not store.object_exists(path):
         return jsonify({"ok": False, "error": "no such published file"}), 404
-    return jsonify({"ok": True, "url": store.signed_url(path), "expires_minutes": 30})
+    return jsonify({"ok": True, "url": store.signed_url(path), "expires_minutes": 15})
+
+
+@app.post("/rollback")
+def rollback():
+    """
+    R3, finally reachable. Put an earlier version back in front of singers.
+
+    Deliberately requires an explicit version number rather than offering a
+    "previous" shortcut: someone rolling back is usually under pressure, and
+    naming the version they want is the point at which they notice if it is
+    not the one they meant.
+    """
+    if not _authorised():
+        return _deny()
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        result = librarian.rollback(
+            work_id=body.get("work_id", ""),
+            to_version=int(body.get("to_version") or 0),
+            actor=body.get("actor", "unknown"),
+        )
+    except KeyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.get("/library/<group>")
+def library(group: str):
+    """
+    The singer-facing list for one group, with a short-lived link per score.
+
+    The Hub calls this server-side and decides who may see it. This endpoint
+    does NOT know about singers or permissions - it answers "what is published
+    for this group", and WordPress owns the question of who that group is.
+    """
+    if not _authorised():
+        return _deny()
+    include_urls = request.args.get("urls", "1") != "0"
+    items = librarian.library(group)
+    if include_urls:
+        for item in items:
+            try:
+                item["url"] = store.signed_url(item["object_path"])
+            except RuntimeError as exc:
+                item["url"] = None
+                item["url_error"] = str(exc)
+    return jsonify({"ok": True, "group": group, "count": len(items), "scores": items})
+
+
+@app.post("/publish-batch")
+def publish_batch():
+    """
+    Publish several staged items in one call. Each is still an explicit
+    decision; this batches the pressing, not the deciding.
+    """
+    if not _authorised():
+        return _deny()
+    body = request.get_json(force=True, silent=True) or {}
+    decisions = body.get("decisions")
+    if not isinstance(decisions, list) or not decisions:
+        return jsonify({"ok": False, "error": "decisions must be a non-empty list"}), 400
+    result = librarian.publish_batch(decisions, actor=body.get("actor", "unknown"))
+    return jsonify({"ok": result["failed"] == 0, **result})
 
 
 @app.post("/propose-name")

@@ -145,16 +145,44 @@ def write_manifest(group: str, entries: list[dict]) -> None:
     )
 
 
-def signed_url(object_path: str, minutes: int = 30) -> str:
+def signed_url(object_path: str, minutes: int = 15) -> str:
     """
-    Short-lived read URL. The bucket has public access prevention on, so this
-    is the only way a byte leaves it - which means access is always a decision
-    the Hub made, never a URL someone found.
+    Short-lived read URL. The bucket has public access prevention on, so this is
+    the only way a byte leaves it - access is always a decision the Hub made,
+    never a URL someone found lying around.
+
+    On Cloud Run there is no private key on disk: the credentials come from the
+    metadata server and cannot sign anything locally. Signing therefore goes
+    through IAM's SignBlob API, which needs the service account to hold
+    roles/iam.serviceAccountTokenCreator ON ITSELF. Without that grant this
+    raises, and the error names the missing role rather than failing vaguely.
     """
     from datetime import timedelta
 
-    return bucket().blob(object_path).generate_signed_url(
-        version="v4",
-        expiration=timedelta(minutes=minutes),
-        method="GET",
-    )
+    import google.auth
+    from google.auth.transport.requests import Request
+
+    creds, _project = google.auth.default()
+    blob = bucket().blob(object_path)
+
+    signer_kwargs = {}
+    if getattr(creds, "signer_email", None) is None:
+        # Metadata-server credentials: delegate signing to IAM.
+        creds.refresh(Request())
+        signer_kwargs = {
+            "service_account_email": getattr(creds, "service_account_email", None),
+            "access_token": creds.token,
+        }
+
+    try:
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=minutes),
+            method="GET",
+            **signer_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "could not sign a download URL. The service account almost certainly "
+            "needs roles/iam.serviceAccountTokenCreator on itself: {}".format(exc)
+        ) from exc

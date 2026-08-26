@@ -188,8 +188,8 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
             raise ValueError("new_edition needs a work_id that exists")
         work = registry["works"][work_id]
         current = next(v for v in work["versions"] if v["n"] == work["current"])
-        if not fingerprint.structure_matches(current["structure"], item["inspected"]) \
-                and not accept_structure_change:
+        structure_ok = fingerprint.structure_matches(current["structure"], item["inspected"])
+        if not structure_ok and not accept_structure_change:
             # Section 3.4. This is the one change that moves every singer's
             # markings, so it cannot happen as a side effect of pressing publish.
             raise ValueError(_structure_change_message(current["structure"], item["inspected"]))
@@ -360,3 +360,143 @@ def mark_missing_at_source(group: str, seen_file_ids: set[str]) -> list[dict]:
             flagged = []
             continue
     raise RuntimeError("registry is being written too fast to make progress")
+
+
+def rollback(work_id: str, to_version: int, actor: str = "unknown") -> dict:
+    """
+    Put an earlier version back in front of singers.
+
+    The spec promised this in R3 - "rollback is a pointer change, not a
+    restore" - and every version has been stored since day one to make it
+    possible. Nothing exposed it until now, which meant the promise was true
+    of the data and false of the system. Found by testing rather than review.
+
+    Nothing is deleted and no version is renumbered. The bytes of the target
+    version are copied back over the published path, and current moves. The
+    version that WAS current stays exactly where it is, so a rollback can
+    itself be rolled back.
+    """
+    registry, gen = load_registry()
+    work = registry["works"].get(work_id)
+    if work is None:
+        raise KeyError("no work {}".format(work_id))
+
+    target = next((v for v in work["versions"] if v["n"] == to_version), None)
+    if target is None:
+        have = ", ".join(str(v["n"]) for v in work["versions"])
+        raise ValueError(
+            "{} has no version {}. Versions on file: {}".format(
+                work["canonical"], to_version, have
+            )
+        )
+    if work["current"] == to_version:
+        raise ValueError(
+            "version {} is already the one singers are getting".format(to_version)
+        )
+
+    was = work["current"]
+    ppath = store.published_path(work["group"], work["project"], work["canonical"])
+    store.copy_object(
+        target["object_path"],
+        ppath,
+        {
+            "work_id": work_id,
+            "version": to_version,
+            "content_sha": target["content_sha"],
+            "page_count": target["structure"]["page_count"],
+            "rolled_back_from": was,
+            "published_by": actor,
+        },
+    )
+
+    work["current"] = to_version
+    work.setdefault("rollbacks", []).append(
+        {"from": was, "to": to_version, "at": _now(), "by": actor}
+    )
+
+    for _attempt in range(5):
+        try:
+            store.write_json(store.REGISTRY_PATH, registry, gen)
+            break
+        except store.Conflict:
+            registry, gen = load_registry()
+            registry["works"][work_id] = work
+    else:
+        raise RuntimeError("registry is being written too fast to make progress")
+
+    return {
+        "work_id": work_id,
+        "canonical": work["canonical"],
+        "now_serving": to_version,
+        "was_serving": was,
+        "published_path": ppath,
+    }
+
+
+def library(group: str) -> list[dict]:
+    """
+    What a singer in this group can actually be given, grouped by project.
+
+    Deliberately NOT the registry dump. This is the singer-facing shape: the
+    name they will see, how many pages, and when it last changed - which is
+    what tells them whether the copy on their iPad is still the current one.
+    """
+    registry, _gen = load_registry()
+    out = []
+    for work in registry["works"].values():
+        if work["group"] != group or not work["versions"]:
+            continue
+        current = next(v for v in work["versions"] if v["n"] == work["current"])
+        out.append(
+            {
+                "work_id": work["work_id"],
+                "canonical": work["canonical"],
+                "project": work["project"],
+                "pages": current["structure"]["page_count"],
+                "version": current["n"],
+                "published_at": current["published_at"],
+                "revised": current["n"] > 1,
+                "source_missing": work.get("source_missing", False),
+                "object_path": store.published_path(
+                    work["group"], work["project"], work["canonical"]
+                ),
+            }
+        )
+    out.sort(key=lambda w: (w["project"], w["canonical"]))
+    return out
+
+
+def publish_batch(decisions: list[dict], actor: str = "unknown") -> dict:
+    """
+    Publish several staged items in one call.
+
+    Exists because the alternative is a human making the same decision eleven
+    times, and a queue that is tedious to clear is a queue that does not get
+    cleared. Each item is still an explicit decision - this batches the
+    pressing, not the deciding.
+
+    One item failing never stops the rest: every result is reported
+    individually, so a page-structure refusal on one score does not silently
+    take four others down with it.
+    """
+    results = []
+    for item in decisions:
+        staging_id = item.get("staging_id", "")
+        try:
+            outcome = publish(
+                staging_id=staging_id,
+                decision=item.get("decision", ""),
+                work_id=item.get("work_id"),
+                canonical=item.get("canonical"),
+                accept_structure_change=bool(item.get("accept_structure_change")),
+                actor=actor,
+            )
+            results.append({"staging_id": staging_id, "ok": True, **outcome})
+        except (KeyError, ValueError) as exc:
+            results.append({"staging_id": staging_id, "ok": False, "error": str(exc)})
+    published = sum(1 for r in results if r["ok"])
+    return {
+        "published": published,
+        "failed": len(results) - published,
+        "results": results,
+    }
