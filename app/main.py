@@ -23,9 +23,13 @@ import time
 
 from flask import Flask, jsonify, request
 
-from . import drive, fingerprint, librarian, naming, store
+from . import dav, drive, fingerprint, librarian, naming, store
 
 app = Flask(__name__)
+
+# Read-only WebDAV over the published mirror. Registered here rather than
+# imported for side effects, so the wiring is visible at the top of the app.
+dav.register(app)
 
 TOKEN = os.environ.get("ANS_SCORES_TOKEN", "")
 
@@ -56,7 +60,7 @@ def _project_from_path(rel_path: list[str]) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.2.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.3.0"})
 
 
 @app.get("/whoami")
