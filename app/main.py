@@ -409,6 +409,46 @@ def staging_list():
     return jsonify({"ok": True, "count": len(items), "items": items})
 
 
+@app.get("/staging/<staging_id>/url")
+def staging_url(staging_id):
+    """
+    Signed links to look at a staged candidate, and at what it would replace.
+
+    /url deliberately refuses anything outside scores/, so it cannot serve a
+    staged file. Rather than loosen that rule, this signs exactly one object:
+    the staging item's own. Same spirit, narrower scope.
+
+    Both links matter. A candidate is approved on the strength of what it
+    LOOKS like, and the only honest way to judge that is beside the thing it
+    replaces - which is precisely the check that would have caught a page
+    rendered as a negative.
+    """
+    if not _authorised():
+        return _deny()
+
+    staging, _gen = librarian.load_staging()
+    item = staging["items"].get(staging_id)
+    if item is None:
+        return jsonify({"ok": False, "error": "no such staged item"}), 404
+
+    spath = item.get("staging_path") or ""
+    if not spath or not store.object_exists(spath):
+        return jsonify({"ok": False, "error": "staged object is missing"}), 404
+
+    out = {"ok": True, "candidate_url": store.signed_url(spath), "expires_minutes": 15}
+
+    work_id = (item.get("proposal") or {}).get("work_id")
+    if work_id:
+        registry, _rgen = librarian.load_registry()
+        work = registry["works"].get(work_id)
+        if work:
+            ppath = store.published_path(work["group"], work["project"], work["canonical"])
+            if store.object_exists(ppath):
+                out["current_url"] = store.signed_url(ppath)
+                out["current_path"] = ppath
+    return jsonify(out)
+
+
 @app.post("/publish")
 def publish():
     if not _authorised():
