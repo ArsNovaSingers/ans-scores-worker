@@ -160,8 +160,23 @@ def build_candidate(path: str, out_path: str) -> dict:
             new_h = max(1, int(height * scale))
 
             try:
-                image = Image.open(io.BytesIO(meta["image"]))
-                image = image.convert("L").resize((new_w, new_h), Image.LANCZOS)
+                # Decode through MuPDF, NOT by handing the raw JPEG to Pillow.
+                #
+                # Tom's four oversized scores are Adobe CMYK JPEGs. Asking
+                # Pillow to interpret those makes the result depend on Pillow's
+                # version, and the container pins one (10.4.0) while a
+                # developer machine has another. fitz.Pixmap(doc, xref) decodes
+                # using the colorspace the PDF itself declares, so CMYK, RGB,
+                # indexed and separation images all arrive already correct and
+                # Pillow only ever sees raw greyscale bytes.
+                pix = fitz.Pixmap(doc, xref)
+                if pix.alpha:
+                    pix = fitz.Pixmap(pix, 0)
+                if pix.n > 1:
+                    pix = fitz.Pixmap(fitz.csGRAY, pix)
+                image = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+                pix = None
+                image = image.resize((new_w, new_h), Image.LANCZOS)
                 buf = io.BytesIO()
                 image.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
 
@@ -178,6 +193,21 @@ def build_candidate(path: str, out_path: str) -> dict:
                 doc.xref_set_key(xref, "BitsPerComponent", "8")
                 doc.xref_set_key(xref, "Filter", "/DCTDecode")
                 doc.xref_set_key(xref, "DecodeParms", "null")
+                # /Decode MUST go, and this is the line that cost a deploy.
+                #
+                # A CMYK image commonly carries /Decode [1 0 1 0 1 0 1 0] - a
+                # four-component inversion. Leave it on an image that is now
+                # single-channel greyscale and the viewer applies "1 0" to the
+                # one channel left, rendering the page as a photographic
+                # negative: white paper turns black.
+                #
+                # Nothing else catches it. The JPEG is valid, no decoder
+                # complains, the page count and geometry are untouched, and the
+                # file is dramatically smaller - it looks like a 90% win. Only
+                # the ink band sees it, and only because the band has an upper
+                # bound: the real scores measured 569-745% and a reproduction
+                # measured 2209%.
+                doc.xref_set_key(xref, "Decode", "null")
                 touched += 1
             except Exception:
                 skipped += 1
