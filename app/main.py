@@ -60,7 +60,7 @@ def _project_from_path(rel_path: list[str]) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.3.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.3.1"})
 
 
 @app.get("/whoami")

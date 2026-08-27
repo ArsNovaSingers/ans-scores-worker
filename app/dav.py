@@ -24,6 +24,13 @@ and the registry is an account of them - so the bytes win. It also means
 listings carry real sizes, real modification times and real checksums, which is
 what lets a client re-pull only what changed.
 
+Byte ranges are honoured (since 0.3.1). The first cut answered every GET with
+the whole file from byte zero and advertised `Accept-Ranges: none`, which is
+two failures rather than one: a client is told not to try resuming, and could
+not have resumed if it had. A published score here reaches 115 MB, so a
+connection that drops at 90% costs the whole download again - and the singers
+this is for are pulling music onto tablets, often not on a good network.
+
 Auth is HTTP Basic, because that is what file apps speak. Credentials come from
 the ANS_DAV_USERS secret as {"username": {"password": "...", "groups": [...]}}
 - so one shared credential per group works today, and per-singer credentials
@@ -147,6 +154,52 @@ def _httpdate(iso: str | None) -> str:
         return format_datetime(datetime.now(timezone.utc), usegmt=True)
 
 
+def _parse_range(header: str, size: int):
+    """
+    Resolve a Range header against a known size.
+
+    Returns (start, end) inclusive for a partial answer, None for "send the
+    whole thing", or False for a range that cannot be satisfied at all.
+
+    A pure function, separate from the response, because this is where range
+    support usually goes wrong and the failure is silent: a client that asks
+    for the last 500 bytes and is handed the first 500 does not complain, it
+    writes a corrupt file. `bytes=-500` means the LAST 500 bytes; `bytes=0-`
+    is what Chrome opens with and must be answered 206, not 200.
+    """
+    if size <= 0 or not header:
+        return None
+    header = header.strip()
+    if not header.startswith("bytes="):
+        return None
+    spec = header[6:].strip()
+    if "," in spec or "-" not in spec:
+        # Multipart ranges need a multipart/byteranges body. Nothing that
+        # syncs a PDF asks for them, and answering with the whole file is a
+        # legal response to a Range we decline to satisfy.
+        return None
+    first, _, last = spec.partition("-")
+    first, last = first.strip(), last.strip()
+    try:
+        if first == "":
+            if last == "":
+                return None
+            length = int(last)
+            if length <= 0:
+                return False
+            start = max(0, size - length)
+            end = size - 1
+        else:
+            start = int(first)
+            end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    end = min(end, size - 1)
+    if start > end or start >= size:
+        return False
+    return (start, end)
+
+
 def _collection(href: str, name: str) -> str:
     return (
         "<D:response><D:href>{href}</D:href><D:propstat><D:prop>"
@@ -245,13 +298,37 @@ def _get(segments: list[str], groups: list[str]) -> Response:
     if meta is None:
         return Response("Not found.", 404)
 
+    size = int(meta.get("size") or 0)
+
     headers = {
         "Content-Type": "application/pdf",
-        "Content-Length": str(meta.get("size") or 0),
         "Last-Modified": _httpdate(meta.get("updated")),
         "ETag": '"{}"'.format(meta.get("md5") or ""),
-        "Accept-Ranges": "none",
+        # Ranges are honoured, and saying so is half the feature: a client
+        # that is told "none" will not attempt a resume at all. The scores
+        # here run to 115 MB, so a dropped connection that restarts from
+        # byte zero is the difference between a singer getting their music
+        # on a phone connection and giving up.
+        "Accept-Ranges": "bytes",
     }
+
+    requested = _parse_range(request.headers.get("Range", ""), size)
+
+    if requested is False:
+        headers["Content-Range"] = "bytes */{}".format(size)
+        return Response("Requested range not satisfiable.", 416, headers)
+
+    if requested is None:
+        start = 0
+        end = size - 1 if size else 0
+        status = 200
+    else:
+        start, end = requested
+        status = 206
+        headers["Content-Range"] = "bytes {}-{}/{}".format(start, end, size)
+
+    length = (end - start + 1) if size else 0
+    headers["Content-Length"] = str(length)
 
     # HEAD is deliberately NOT a separate branch. Returning an empty body
     # made Werkzeug recompute Content-Length as 0, so a client asking how big
@@ -263,15 +340,22 @@ def _get(segments: list[str], groups: list[str]) -> Response:
 
     def stream():
         # Streamed rather than downloaded whole: a full score runs to hundreds
-        # of megabytes and must never sit in this container's memory.
+        # of megabytes and must never sit in this container's memory. The
+        # remaining counter is what keeps a partial answer partial - reading
+        # to EOF after seeking would send the rest of the file and contradict
+        # the Content-Length just promised.
+        remaining = length
         with blob.open("rb") as handle:
-            while True:
-                chunk = handle.read(CHUNK)
+            if start:
+                handle.seek(start)
+            while remaining > 0:
+                chunk = handle.read(min(CHUNK, remaining))
                 if not chunk:
                     break
+                remaining -= len(chunk)
                 yield chunk
 
-    return Response(stream_with_context(stream()), 200, headers)
+    return Response(stream_with_context(stream()), status, headers)
 
 
 def register(app) -> None:
