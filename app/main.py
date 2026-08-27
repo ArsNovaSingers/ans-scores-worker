@@ -2,10 +2,10 @@
 ans-scores-worker - HTTP surface.
 
 claude/portal/Device_Sync_Spec.md. What exists here: the Drive walk, identity,
-staging, publishing under frozen names, versioning, rollback, and the
-group library the Hub renders from. What does not exist yet, on purpose:
-PDF optimisation and Tom's approval queue (Phase 2), WebDAV (Phase 5), and
-quiet hours (Phase 6).
+staging, publishing under frozen names, versioning, rollback, the group library
+the Hub renders from, read-only WebDAV (Phase 5), and PDF optimisation offered
+for a human's approval (Phase 2, /optimise/scan). What does not exist yet, on
+purpose: quiet hours (Phase 6).
 
 This service knows nothing about singers or permissions. /library answers
 "what is published for this group"; WordPress owns "who is in that group".
@@ -23,7 +23,7 @@ import time
 
 from flask import Flask, jsonify, request
 
-from . import dav, drive, fingerprint, librarian, naming, store
+from . import dav, drive, fingerprint, librarian, naming, optimise, store
 
 app = Flask(__name__)
 
@@ -60,7 +60,177 @@ def _project_from_path(rel_path: list[str]) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.3.1"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.4.0"})
+
+
+@app.post("/optimise/scan")
+def optimise_scan():
+    """
+    Offer smaller versions of what is already published. Publishes nothing.
+
+    Per Device_Sync_Spec 3.5 and Jonathan's 2026-08-25 ruling, optimisation is
+    never applied automatically. This walks a group's published works, builds a
+    candidate for each, and parks the ones worth looking at in the SAME staging
+    queue that Drive intake uses - so approving one is the ordinary
+    `POST /publish {decision: "new_edition"}` and inherits everything that
+    already guards a publish: R3 ordering, the section 3.4 page-count gate, the
+    version history, and rollback.
+
+    Reusing that queue rather than building a parallel one is the whole design.
+    A second approval mechanism would be a second place for "is this safe to
+    publish" to be answered, and the two would drift.
+
+    Body: {group, project?, limit?}
+    """
+    if not _authorised():
+        return _deny()
+
+    body = request.get_json(silent=True) or {}
+    group = str(body.get("group") or "").strip()
+    only_project = str(body.get("project") or "").strip()
+    limit = int(body.get("limit") or 25)
+    if not group:
+        return jsonify({"ok": False, "error": "group is required"}), 400
+
+    registry, _gen = librarian.load_registry()
+    staging, _sgen = librarian.load_staging()
+
+    # A work already waiting for a decision must not be offered twice - Tom
+    # would see the same score in the queue as many times as this is run.
+    pending_works = {
+        item.get("optimisation", {}).get("work_id")
+        for item in staging["items"].values()
+        if item.get("state") == "pending" and item.get("optimisation")
+    }
+
+    results = []
+    examined = 0
+
+    for work_id, work in registry["works"].items():
+        if work.get("group") != group:
+            continue
+        if only_project and work.get("project") != only_project:
+            continue
+        if not work.get("versions"):
+            continue
+        if work_id in pending_works:
+            results.append({"canonical": work["canonical"], "outcome": "already in the queue"})
+            continue
+        if examined >= limit:
+            results.append({"canonical": work["canonical"], "outcome": "not examined this run"})
+            continue
+        examined += 1
+
+        ppath = store.published_path(work["group"], work["project"], work["canonical"])
+        if not store.object_exists(ppath):
+            results.append({"canonical": work["canonical"], "outcome": "no published object"})
+            continue
+
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "published.pdf")
+            candidate = os.path.join(tmp, "candidate.pdf")
+            try:
+                store.bucket().blob(ppath).download_to_filename(local)
+            except Exception as exc:  # noqa: BLE001
+                results.append({"canonical": work["canonical"], "outcome": "download_failed",
+                                "detail": str(exc)})
+                continue
+
+            try:
+                report = optimise.assess(local, candidate)
+            except Exception as exc:  # noqa: BLE001
+                # An unreadable or unhandleable file is reported, never skipped
+                # quietly - Org Portal spec 5.6.
+                results.append({"canonical": work["canonical"], "outcome": "optimise_failed",
+                                "detail": str(exc)})
+                continue
+
+            row = {
+                "canonical": work["canonical"],
+                "work_id": work_id,
+                "bytes_before": report["bytes_before"],
+                "bytes_after": report["bytes_after"],
+                "saved_ratio": report["saved_ratio"],
+                "outcome": report["outcome"],
+                "worth_showing": report["worth_showing"],
+            }
+
+            if not report["worth_showing"]:
+                results.append(row)
+                continue
+
+            # The candidate has to be inspected in its own right: publish()
+            # compares its structure against the current version and refuses a
+            # page-count change. That check is redundant with optimise.verify()
+            # by design - two independent gates on the one thing that would
+            # move every singer's annotations.
+            try:
+                inspected = fingerprint.inspect(candidate)
+            except ValueError as exc:
+                results.append({**row, "outcome": "candidate unreadable: %s" % exc,
+                                "worth_showing": False})
+                continue
+
+            sha = fingerprint.content_sha(candidate)
+            staging_id = librarian.stage(
+                {
+                    "group": work["group"],
+                    "project": work["project"],
+                    "source_file_id": "optimise:%s" % work_id,
+                    "source_name": work["canonical"] + ".pdf (optimised)",
+                    "source_size": report["bytes_after"],
+                    "source_modified": None,
+                    "content_sha": sha,
+                    "inspected": inspected,
+                    "proposal": {
+                        "decision": "new_edition",
+                        "work_id": work_id,
+                        "confidence": "certain",
+                        "why": "an optimised copy of the currently published file",
+                    },
+                    "optimisation": {
+                        "work_id": work_id,
+                        "bytes_before": report["bytes_before"],
+                        "bytes_after": report["bytes_after"],
+                        "saved_bytes": report["saved_bytes"],
+                        "saved_ratio": report["saved_ratio"],
+                        "target_dpi": optimise.TARGET_DPI,
+                        "jpeg_quality": optimise.JPEG_QUALITY,
+                        "images_reencoded": report.get("images_reencoded", 0),
+                        "verify": report["verify"],
+                        "source": report["source"],
+                    },
+                    "staging_path": "",
+                }
+            )
+            spath = store.staging_path(staging_id)
+            store.upload_file(candidate, spath, {"staging_id": staging_id, "sha256": sha})
+
+            for _attempt in range(5):
+                stg, gen = librarian.load_staging()
+                stg["items"][staging_id]["staging_path"] = spath
+                try:
+                    store.write_json(store.STAGING_PATH, stg, gen)
+                    break
+                except store.Conflict:
+                    continue
+
+            row["staging_id"] = staging_id
+            results.append(row)
+
+    offered = [r for r in results if r.get("worth_showing")]
+    return jsonify(
+        {
+            "ok": True,
+            "group": group,
+            "examined": examined,
+            "offered": len(offered),
+            "would_save_bytes": sum(r["bytes_before"] - r["bytes_after"] for r in offered),
+            "results": results,
+            "note": "Nothing was published. Approve one with "
+                    "POST /publish {staging_id, decision: 'new_edition', work_id}.",
+        }
+    )
 
 
 @app.get("/whoami")

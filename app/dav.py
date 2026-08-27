@@ -55,6 +55,11 @@ from . import store
 DAV_ROOT = "/dav"
 CHUNK = 262144
 
+# Cloud Run's non-streamed response cap is 32 MiB. Sit under it with room to
+# spare rather than on it: the cap is applied to the whole response, and
+# headers are part of a response.
+STREAM_ABOVE = 30 * 1024 * 1024
+
 
 def _users() -> dict:
     """
@@ -328,14 +333,37 @@ def _get(segments: list[str], groups: list[str]) -> Response:
         headers["Content-Range"] = "bytes {}-{}/{}".format(start, end, size)
 
     length = (end - start + 1) if size else 0
-    headers["Content-Length"] = str(length)
 
-    # HEAD is deliberately NOT a separate branch. Returning an empty body
-    # made Werkzeug recompute Content-Length as 0, so a client asking how big
-    # a score is was told nothing - which is exactly what HEAD is for. The
-    # streaming response below carries an explicit length that survives,
-    # because a generator's size cannot be recomputed, and Werkzeug drops the
-    # body itself for a HEAD request. Caught by a test, not by review.
+    """
+    Cloud Run caps a NON-STREAMED response at 32 MiB and answers 500 above it.
+    Measured on this service against the 62.3 MB Dellaira score: 31.5 MiB came
+    back 206, 32.0 MiB came back 500, and so did the whole file. Four of the
+    eleven published Chamber scores were undeliverable - and they are the only
+    four anybody wants bulk sync for.
+
+    Declaring Content-Length is what makes a response non-streamed: Werkzeug
+    sends it as one buffered body instead of chunked transfer encoding. So
+    above the cap we omit it and let the generator stream.
+
+    The cost is real and worth stating rather than hiding: without
+    Content-Length a client shows an indeterminate progress bar. That is why
+    the threshold is a threshold and not "always stream" - everything small
+    enough to be safe keeps its length, and only the files that would
+    otherwise fail outright give it up.
+
+    HEAD always keeps Content-Length. Reporting a size is the entire purpose
+    of HEAD, it carries no body, and a body-less response cannot breach a
+    body-size cap.
+    """
+    if request.method == "HEAD" or length <= STREAM_ABOVE:
+        headers["Content-Length"] = str(length)
+
+    # HEAD is deliberately NOT a separate branch. Returning an empty body made
+    # Werkzeug recompute Content-Length as 0, so a client asking how big a
+    # score is was told nothing - which is exactly what HEAD is for. Sharing
+    # the GET path means the length set above survives, because a generator's
+    # size cannot be recomputed, and Werkzeug drops the body itself for a HEAD
+    # request. Caught by a test, not by review.
     blob = store.bucket().blob("scores/{}/{}/{}".format(group, project, name))
 
     def stream():
