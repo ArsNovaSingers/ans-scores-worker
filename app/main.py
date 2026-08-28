@@ -60,7 +60,160 @@ def _project_from_path(rel_path: list[str]) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.4.1"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.5.0"})
+
+
+@app.get("/drive/folders")
+def drive_folders():
+    """
+    Browse Drive one level at a time, so a person can pick a folder instead of
+    pasting an id they had to go and find.
+
+    No parent: the shared drives this service account can see. With a parent:
+    that folder's immediate subfolders, plus its own name and parent so the
+    caller can draw a breadcrumb and a way back up.
+    """
+    if not _authorised():
+        return _deny()
+
+    parent = (request.args.get("parent") or "").strip()
+    svc = drive.service()
+
+    try:
+        if not parent:
+            drives = drive.shared_drives(svc)
+            return jsonify(
+                {
+                    "ok": True,
+                    "at": None,
+                    "folders": [{"id": d["id"], "name": d["name"]} for d in drives],
+                    "is_root": True,
+                }
+            )
+        info = drive.folder_info(parent, svc)
+        if not info.get("is_folder"):
+            return jsonify({"ok": False, "error": "that id is not a folder"}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "at": info,
+                "folders": drive.list_folders(parent, svc),
+                "is_root": False,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A folder the service account cannot see is the single most likely
+        # failure here, and it needs to say so rather than "error".
+        return jsonify(
+            {
+                "ok": False,
+                "error": "Drive would not show that folder. The most likely reason is that "
+                         "the service account is not a member of the drive it lives in.",
+                "detail": str(exc),
+            }
+        ), 502
+
+
+@app.post("/optimise/staged")
+def optimise_staged():
+    """
+    Make a staged file smaller BEFORE it is ever published.
+
+    /optimise/scan works on what is already published, which was the right
+    first step for the scores that are already out there. This is the better
+    place for it: a file caught on the way in is published small from the
+    start, so no singer ever downloads the large version and no second version
+    is needed to replace it.
+
+    The staged object is replaced in place and the item's fingerprint is
+    recalculated, because the bytes a person approves must be the bytes that
+    get published - staging a big file and publishing a small one would make
+    the approval a lie.
+
+    Body: {staging_id}
+    """
+    if not _authorised():
+        return _deny()
+
+    body = request.get_json(silent=True) or {}
+    staging_id = (body.get("staging_id") or "").strip()
+    if not staging_id:
+        return jsonify({"ok": False, "error": "staging_id is required"}), 400
+
+    staging, _gen = librarian.load_staging()
+    item = staging["items"].get(staging_id)
+    if item is None:
+        return jsonify({"ok": False, "error": "no such staged item"}), 404
+    if item.get("state") != "pending":
+        return jsonify({"ok": False, "error": "that item is already " + str(item.get("state"))}), 400
+
+    spath = item.get("staging_path") or ""
+    if not spath or not store.object_exists(spath):
+        return jsonify({"ok": False, "error": "the staged file is missing"}), 404
+
+    with tempfile.TemporaryDirectory() as tmp:
+        local = os.path.join(tmp, "staged.pdf")
+        candidate = os.path.join(tmp, "smaller.pdf")
+        store.bucket().blob(spath).download_to_filename(local)
+
+        try:
+            report = optimise.assess(local, candidate)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": "could not optimise", "detail": str(exc)}), 500
+
+        if not report["worth_showing"]:
+            return jsonify(
+                {
+                    "ok": True,
+                    "changed": False,
+                    "outcome": report["outcome"],
+                    "bytes_before": report["bytes_before"],
+                }
+            )
+
+        inspected = fingerprint.inspect(candidate)
+        sha = fingerprint.content_sha(candidate)
+        store.upload_file(candidate, spath, {"staging_id": staging_id, "sha256": sha})
+
+    for _attempt in range(5):
+        stg, gen = librarian.load_staging()
+        entry = stg["items"].get(staging_id)
+        if entry is None:
+            return jsonify({"ok": False, "error": "the staged item vanished"}), 404
+        entry["content_sha"] = sha
+        entry["inspected"] = inspected
+        entry["source_size"] = report["bytes_after"]
+        entry["optimisation"] = {
+            "bytes_before": report["bytes_before"],
+            "bytes_after": report["bytes_after"],
+            "saved_bytes": report["saved_bytes"],
+            "saved_ratio": report["saved_ratio"],
+            "target_dpi": optimise.TARGET_DPI,
+            "jpeg_quality": optimise.JPEG_QUALITY,
+            "images_reencoded": report.get("images_reencoded", 0),
+            "verify": report["verify"],
+            "source": report["source"],
+            "applied_before_publishing": True,
+        }
+        try:
+            store.write_json(store.STAGING_PATH, stg, gen)
+            break
+        except store.Conflict:
+            continue
+    else:
+        return jsonify({"ok": False, "error": "staging is being written too fast"}), 503
+
+    return jsonify(
+        {
+            "ok": True,
+            "changed": True,
+            "outcome": report["outcome"],
+            "bytes_before": report["bytes_before"],
+            "bytes_after": report["bytes_after"],
+            "saved_ratio": report["saved_ratio"],
+            "verify": report["verify"],
+        }
+    )
 
 
 @app.post("/optimise/scan")

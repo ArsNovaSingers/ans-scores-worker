@@ -92,6 +92,65 @@ def walk(folder_id: str, svc=None) -> list[dict]:
     return out
 
 
+def list_folders(parent_id: str, svc=None) -> list[dict]:
+    """
+    The immediate subfolders of one folder. One level, never recursive.
+
+    This is what a person browses with, and browsing is a different job from
+    walk(): walk() reads an entire tree to find work, which on the Singers Hub
+    is hundreds of files and several seconds. A picker that did that per click
+    would be unusable, and would read the whole drive to show six names.
+    """
+    svc = svc or service()
+    out: list[dict] = []
+    token = None
+    while True:
+        resp = (
+            svc.files()
+            .list(
+                q=(
+                    "'{}' in parents and trashed = false "
+                    "and mimeType = 'application/vnd.google-apps.folder'"
+                ).format(parent_id),
+                fields="nextPageToken, files(id, name)",
+                orderBy="name",
+                pageSize=200,
+                pageToken=token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        out.extend(resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return out
+
+
+def folder_info(folder_id: str, svc=None) -> dict:
+    """Name and parent of one folder, so a picker can show where it is."""
+    svc = svc or service()
+    meta = (
+        svc.files()
+        .get(fileId=folder_id, fields="id, name, parents, mimeType", supportsAllDrives=True)
+        .execute()
+    )
+    return {
+        "id": meta.get("id"),
+        "name": meta.get("name"),
+        "parents": meta.get("parents", []),
+        "is_folder": meta.get("mimeType") == "application/vnd.google-apps.folder",
+    }
+
+
+def shared_drives(svc=None) -> list[dict]:
+    """The shared drives this service account can see — the top of the tree."""
+    svc = svc or service()
+    resp = svc.drives().list(pageSize=100, fields="drives(id, name)").execute()
+    return resp.get("drives", [])
+
+
 def download(file_id: str, dest_path: str, svc=None) -> None:
     """Stream a file to disk. These run to hundreds of MB - never into memory whole."""
     svc = svc or service()
