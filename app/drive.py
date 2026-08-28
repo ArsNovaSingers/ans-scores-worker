@@ -129,17 +129,38 @@ def list_folders(parent_id: str, svc=None) -> list[dict]:
 
 
 def folder_info(folder_id: str, svc=None) -> dict:
-    """Name and parent of one folder, so a picker can show where it is."""
+    """
+    Name and parent of one folder, so a picker can show where it is.
+
+    The root of a shared drive is a special case worth handling rather than
+    living with: files().get() on one returns the literal name "Drive", so a
+    breadcrumb at the top of "Singers Hub (Choir Members Shared)" would read
+    "Drive" and give no clue which drive you are in. The drives() endpoint
+    knows the real name, so ask it when the id turns out to be a drive.
+    """
     svc = svc or service()
     meta = (
         svc.files()
-        .get(fileId=folder_id, fields="id, name, parents, mimeType", supportsAllDrives=True)
+        .get(fileId=folder_id, fields="id, name, parents, mimeType, driveId", supportsAllDrives=True)
         .execute()
     )
+
+    name = meta.get("name")
+    parents = meta.get("parents", [])
+    if not parents:
+        # No parent means this is the top of something. If that something is a
+        # shared drive, its own record carries the name people recognise.
+        try:
+            drive_meta = svc.drives().get(driveId=folder_id, fields="id, name").execute()
+            if drive_meta.get("name"):
+                name = drive_meta["name"]
+        except Exception:  # noqa: BLE001 - an ordinary folder is not a drive
+            pass
+
     return {
         "id": meta.get("id"),
-        "name": meta.get("name"),
-        "parents": meta.get("parents", []),
+        "name": name,
+        "parents": parents,
         "is_folder": meta.get("mimeType") == "application/vnd.google-apps.folder",
     }
 
