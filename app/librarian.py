@@ -539,6 +539,9 @@ def library(group: str) -> list[dict]:
                 "mime": media.content_type(store.work_ext(work)),
                 "size": int(current.get("size") or 0),
                 "source_name": current.get("source_name", ""),
+                # Lets the Hub recognise a file someone already linked by hand
+                # from Drive, and show it once rather than twice.
+                "source_file_id": current.get("source_file_id", ""),
                 "object_path": store.work_published_path(work),
             }
         )
