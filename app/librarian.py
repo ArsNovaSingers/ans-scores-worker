@@ -15,7 +15,7 @@ certain returns a question for a human instead of an answer.
 import time
 import uuid
 
-from . import fingerprint, naming, store
+from . import fingerprint, media, naming, store
 
 # A name this close, in the same project folder, is worth ASKING about.
 # It is never enough to act on by itself.
@@ -138,6 +138,66 @@ def _ambiguous(works: list[dict], why: str) -> dict:
     }
 
 
+def match_audio(content_sha: str, source_file_id: str, source_name: str,
+                group: str, project: str, registry: dict) -> dict:
+    """
+    Identity for a recording. See media.py for why this is not match().
+
+    Bytes first, then the Drive file it came from. Never the name.
+    """
+    candidates = [
+        w for w in registry["works"].values()
+        if w["group"] == group and w.get("media") == media.AUDIO
+    ]
+
+    for work in candidates:
+        if work["project"] != project:
+            continue
+        for version in work["versions"]:
+            if version["content_sha"] == content_sha:
+                return {
+                    "decision": "duplicate",
+                    "work_id": work["work_id"],
+                    "canonical": work["canonical"],
+                    "version": version["n"],
+                    "why": "byte-identical to version {} already published".format(version["n"]),
+                }
+
+    same_file = [
+        w for w in candidates
+        if any(v.get("source_file_id") == source_file_id for v in w["versions"])
+    ]
+    if len(same_file) == 1:
+        work = same_file[0]
+        return {
+            "decision": "new_edition",
+            "work_id": work["work_id"],
+            "canonical": work["canonical"],
+            "confidence": "certain",
+            "why": "the same Drive file as {}, with new audio in it".format(work["canonical"]),
+            "structure_change": False,
+        }
+    if len(same_file) > 1:
+        return _ambiguous(same_file, "several recordings came from this Drive file")
+
+    proposed = media.audio_canonical(media.stem_of(source_name))
+    taken = {
+        w["canonical"] for w in registry["works"].values()
+        if w["group"] == group and w["project"] == project
+    }
+    base, n = proposed, 2
+    while proposed in taken:
+        proposed = "{} ({})".format(base, n)
+        n += 1
+
+    return {
+        "decision": "new_work",
+        "confidence": "certain",
+        "why": "a recording this folder has not published before",
+        "proposed_canonical": proposed,
+    }
+
+
 def _structure_ok(inspected: dict, work: dict) -> bool:
     current = next(v for v in work["versions"] if v["n"] == work["current"])
     return fingerprint.structure_matches(current["structure"], inspected)
@@ -201,10 +261,13 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
         if not proposed:
             raise ValueError("new_work needs a canonical name")
         _assert_name_free(registry, item["group"], item["project"], proposed)
+        item_media = item["inspected"].get("media", media.PDF)
         work = {
             "work_id": work_id,
             "group": item["group"],
             "project": item["project"],
+            "media": item_media,
+            "ext": item["inspected"].get("ext", "pdf"),
             "canonical": proposed,          # frozen from here. R2.
             "created": _now(),
             "versions": [],
@@ -216,9 +279,20 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
     else:
         raise ValueError("decision must be new_work, new_edition or reject")
 
+    item_ext = item["inspected"].get("ext", "pdf")
+    if item_ext != store.work_ext(work):
+        # A published name is a filename. Swapping an mp3 for an m4a under
+        # it would leave the old file serving at the old path with nobody
+        # told, so a change of format is a new work, never a new version.
+        raise ValueError(
+            "{} is published as .{}; this file is .{}. Publish it as a new work.".format(
+                work["canonical"], store.work_ext(work), item_ext
+            )
+        )
+
     canonical_name = work["canonical"]
-    vpath = store.version_path(work_id, n, canonical_name)
-    ppath = store.published_path(item["group"], item["project"], canonical_name)
+    vpath = store.version_path(work_id, n, canonical_name, item_ext)
+    ppath = store.published_path(item["group"], item["project"], canonical_name, item_ext)
 
     meta = {
         "work_id": work_id,
@@ -242,6 +316,7 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
             "n": n,
             "content_sha": item["content_sha"],
             "edition_key": item["inspected"]["edition_key"],
+            "size": int(item.get("source_size") or 0),
             "structure": {
                 "page_count": item["inspected"]["page_count"],
                 "page_dims": item["inspected"]["page_dims"],
@@ -395,7 +470,7 @@ def rollback(work_id: str, to_version: int, actor: str = "unknown") -> dict:
         )
 
     was = work["current"]
-    ppath = store.published_path(work["group"], work["project"], work["canonical"])
+    ppath = store.work_published_path(work)
     store.copy_object(
         target["object_path"],
         ppath,
@@ -457,9 +532,14 @@ def library(group: str) -> list[dict]:
                 "published_at": current["published_at"],
                 "revised": current["n"] > 1,
                 "source_missing": work.get("source_missing", False),
-                "object_path": store.published_path(
-                    work["group"], work["project"], work["canonical"]
-                ),
+                # v0.6.0. Absent on a pre-audio consumer's reading is fine:
+                # everything published before then is a PDF.
+                "media": work.get("media", media.PDF),
+                "ext": store.work_ext(work),
+                "mime": media.content_type(store.work_ext(work)),
+                "size": int(current.get("size") or 0),
+                "source_name": current.get("source_name", ""),
+                "object_path": store.work_published_path(work),
             }
         )
     out.sort(key=lambda w: (w["project"], w["canonical"]))

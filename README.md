@@ -82,6 +82,38 @@ Drive's own md5 and modifiedTime, which matters when a folder holds
 hundreds of megabytes. `limit` bounds one run; the response reports how many
 were left for the next one.
 
+### Recordings (v0.6.0)
+
+Audio goes through the same scan, staging, versioning and rollback as a score,
+under a different identity rule, because a recording carries no annotation
+layer for a wrong call to damage:
+
+| Signal | Decides |
+|---|---|
+| SHA-256 of the bytes | duplicate - nothing to do |
+| The same Drive file id | a new version of that recording (Tom replaced it in place) |
+| Anything else | a new recording |
+
+Name similarity is **not** used: `Mvt6-SOPclick` and `Mvt1-SOPclick` are one
+character apart and are different recordings. The published name is Tom's
+filename stem as uploaded (a trailing rehearsal date is kept - on a recording
+it says which rehearsal). When a folder holds `take.wav` and `take.mp3`, only
+the compressed one is published. Objects keep their own extension and content
+type: `scores/<group>/<project>/<name>.mp3`. `/library` rows carry `media`,
+`ext`, `mime` and `size`.
+
+`/scan` takes an optional `auto_publish` block:
+
+```
+{"auto_publish": {"audio": true, "new_work_projects": ["RehearsalNotes"]}}
+```
+
+`audio` publishes a recording in the same call when its identity is certain.
+`new_work_projects` publishes a PDF that matches **nothing** already published,
+only in the named project folders - meant for dated rehearsal notes, which are
+always new. A PDF that might be an edition of an existing score is always left
+for a human; R4 is about exactly that case.
+
 ### Publishing
 
 ```
@@ -140,8 +172,10 @@ growing here to disagree with the first one.
 - **Project is inferred from the folder path**, dropping container-ish trailing
   segments (`PDFs`, `Scores`, `Sheet Music`). That is a heuristic and it is
   meant to be replaced by an explicit mapping once the Hub owns it.
-- **PDFs only.** Rehearsal audio and video share the folders and are ignored
-  here; they need the same pipeline without any of the naming machinery.
+- **Scores and recordings; nothing else.** Since v0.6.0 audio (`mp3`, `m4a`,
+  `aac`, `wav`, `aif(f)`, `flac`, `ogg`) is published alongside PDFs. Video,
+  images, Google Docs and DAW leftovers (`.asd`) are reported under `ignored`
+  in the scan response and never published.
 - **Staged candidates are left in `_staging/`** after publishing. A lifecycle
   rule should age them out; there isn't one yet.
 
