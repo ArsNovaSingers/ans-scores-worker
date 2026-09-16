@@ -129,25 +129,50 @@ def _href(*parts: str) -> str:
 
 def _tree(group: str) -> dict:
     """
-    {project: {filename: {size, updated, md5}}} for one group, from the bucket.
+    One group's published files as a nested tree:
 
-    Anything not directly under scores/<group>/<project>/<file> is skipped
-    rather than guessed at - a stray object should be invisible, not a folder
-    a singer can wander into.
+        {"dirs": {name: node, ...}, "files": {name: {size, updated, md5}}}
+
+    Until v0.7.0 this was exactly two levels, project then file, and anything
+    deeper was skipped. Recordings made nested folders ordinary - a concert's
+    `Click Tracks` folder publishes as `<concert>/Click Tracks/<file>` - so the
+    tree now goes as deep as the objects do. Files directly under the group are
+    still skipped: nothing is ever published there, and a stray object should
+    be invisible rather than something a singer can open.
     """
-    projects: dict = {}
+    root: dict = {"dirs": {}, "files": {}}
     prefix_len = len("scores/{}/".format(group))
     for blob in store.list_published(group):
-        rest = str(blob.get("path", ""))[prefix_len:]
-        parts = rest.split("/")
-        if len(parts) != 2 or not parts[0] or not parts[1]:
+        parts = [p for p in str(blob.get("path", ""))[prefix_len:].split("/")]
+        if len(parts) < 2 or any(not p for p in parts):
             continue
-        projects.setdefault(parts[0], {})[parts[1]] = {
+        node = root
+        for part in parts[:-1]:
+            node = node["dirs"].setdefault(part, {"dirs": {}, "files": {}})
+        node["files"][parts[-1]] = {
             "size": int(blob.get("size") or 0),
             "updated": blob.get("updated"),
             "md5": blob.get("md5") or "",
         }
-    return projects
+    return root
+
+
+def _walk(tree: dict, parts: list[str]):
+    """
+    Resolve a path inside a group's tree.
+
+    Returns ("dir", node), ("file", meta) or (None, None).
+    """
+    node = tree
+    for i, part in enumerate(parts):
+        last = i == len(parts) - 1
+        if part in node["dirs"]:
+            node = node["dirs"][part]
+            continue
+        if last and part in node["files"]:
+            return "file", node["files"][part]
+        return None, None
+    return "dir", node
 
 
 def _httpdate(iso: str | None) -> str:
@@ -266,42 +291,34 @@ def _propfind(segments: list[str], groups: list[str]) -> Response:
     group = segments[0]
     if group not in groups:
         return Response("Not found.", 404)
-    tree = _tree(group)
-
-    if len(segments) == 1:
-        out = [_collection(_href(group) + "/", group)]
-        if deep:
-            for project in sorted(tree):
-                out.append(_collection(_href(group, project) + "/", project))
-        return _multistatus(out)
-
-    project = segments[1]
-    if project not in tree:
+    rest = segments[1:]
+    kind, found = _walk(_tree(group), rest)
+    if kind is None:
         return Response("Not found.", 404)
+    here = _href(group, *rest)
 
-    if len(segments) == 2:
-        out = [_collection(_href(group, project) + "/", project)]
-        if deep:
-            for name in sorted(tree[project]):
-                out.append(_file(_href(group, project, name), name, tree[project][name]))
-        return _multistatus(out)
+    if kind == "file":
+        return _multistatus([_file(here, rest[-1], found)])
 
-    name = segments[2]
-    if len(segments) > 3 or name not in tree[project]:
-        return Response("Not found.", 404)
-    return _multistatus([_file(_href(group, project, name), name, tree[project][name])])
+    name = rest[-1] if rest else group
+    out = [_collection(here + "/", name)]
+    if deep:
+        for child in sorted(found["dirs"]):
+            out.append(_collection(_href(group, *rest, child) + "/", child))
+        for child in sorted(found["files"]):
+            out.append(_file(_href(group, *rest, child), child, found["files"][child]))
+    return _multistatus(out)
 
 
 def _get(segments: list[str], groups: list[str]) -> Response:
-    if len(segments) != 3:
+    if len(segments) < 3:
         return Response("Not found.", 404)
-    group, project, name = segments
+    group, name = segments[0], segments[-1]
     if group not in groups:
         return Response("Not found.", 404)
 
-    tree = _tree(group)
-    meta = tree.get(project, {}).get(name)
-    if meta is None:
+    kind, meta = _walk(_tree(group), segments[1:])
+    if kind != "file":
         return Response("Not found.", 404)
 
     size = int(meta.get("size") or 0)
@@ -365,7 +382,7 @@ def _get(segments: list[str], groups: list[str]) -> Response:
     # the GET path means the length set above survives, because a generator's
     # size cannot be recomputed, and Werkzeug drops the body itself for a HEAD
     # request. Caught by a test, not by review.
-    blob = store.bucket().blob("scores/{}/{}/{}".format(group, project, name))
+    blob = store.bucket().blob("scores/" + "/".join(segments))
 
     def stream():
         # Streamed rather than downloaded whole: a full score runs to hundreds

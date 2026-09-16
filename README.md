@@ -114,6 +114,27 @@ only in the named project folders - meant for dated rehearsal notes, which are
 always new. A PDF that might be an edition of an existing score is always left
 for a human; R4 is about exactly that case.
 
+### One space per concert (v0.7.0)
+
+```
+{"group": "ans", "folder_id": "...", "project_prefix": "Darkness & Light"}
+```
+
+With a `project_prefix`, every file is published under it, keeping its
+subfolders: `scores/ans/Darkness & Light/Click Tracks/Mvt1-SOPclick.mp3`.
+Without one, a scan names projects by path inside the scanned folder exactly
+as before - which is what every project published before v0.7.0 uses, and
+those names are frozen (R2). The unprefixed scheme could not keep two concerts
+of one group apart: both would publish a `Click Tracks` folder as
+`ans/Click Tracks`.
+
+The scan response lists `folders_in_scan` - every mirror folder the walk can
+publish into, changed or not - so the Hub can show a new subfolder without
+anyone typing its name. `missing_at_source` now only judges works inside the
+scan's own folders; a scan of one concert no longer flags another's.
+
+WebDAV serves the tree as deep as it goes.
+
 ### Publishing
 
 ```
@@ -169,9 +190,9 @@ growing here to disagree with the first one.
 - **`max-instances=1`.** The registry writes use if-generation-match
   preconditions and would be correct without it, but one instance removes a
   whole class of race entirely while the system is young.
-- **Project is inferred from the folder path**, dropping container-ish trailing
-  segments (`PDFs`, `Scores`, `Sheet Music`). That is a heuristic and it is
-  meant to be replaced by an explicit mapping once the Hub owns it.
+- **Project is inferred from the folder path**, dropping container-ish
+  segments (`PDFs`, `Scores`, `Sheet Music`), under the scan's
+  `project_prefix` when one is given.
 - **Scores and recordings; nothing else.** Since v0.6.0 audio (`mp3`, `m4a`,
   `aac`, `wav`, `aif(f)`, `flac`, `ogg`) is published alongside PDFs. Video,
   images, Google Docs and DAW leftovers (`.asd`) are reported under `ignored`

@@ -53,14 +53,36 @@ def _deny():
     return jsonify({"ok": False, "error": "unauthorised"}), 401
 
 
-def _project_from_path(rel_path: list[str]) -> str:
+def _project_from_path(rel_path: list[str], prefix: str = "") -> str:
+    """
+    The mirror "project" a file is published under.
+
+    Without a prefix this is the path inside the scanned folder, which is how
+    every project published before v0.7.0 was named - and those names are
+    frozen (R2), so the rule is unchanged for them.
+
+    WITH a prefix (v0.7.0) every path is placed under it: `Darkness & Light`,
+    `Darkness & Light/Click Tracks`. Two concerts of one ensemble can then
+    both have a `Click Tracks` folder without showing each other's files,
+    which the unprefixed scheme could not promise - both would have been
+    `ans/Click Tracks`.
+    """
     parts = [p for p in rel_path if p.strip().lower() not in CONTAINER_SEGMENTS]
+    if prefix:
+        return "/".join([prefix] + parts)
     return "/".join(parts) if parts else "_root"
+
+
+def _clean_prefix(raw) -> str:
+    """A prefix is a folder name in an object path: no slashes at the ends, no dot segments."""
+    parts = [p.strip() for p in str(raw or "").replace("\\", "/").split("/")]
+    parts = [p for p in parts if p and p not in (".", "..")]
+    return "/".join(parts)
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.6.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.7.0"})
 
 
 @app.get("/drive/folders")
@@ -439,6 +461,7 @@ def scan():
         str(p).strip().lower() for p in (auto.get("new_work_projects") or []) if str(p).strip()
     }
     actor = str(body.get("actor") or "scan")
+    prefix = _clean_prefix(body.get("project_prefix"))
     if not group or not folder_id:
         return jsonify({"ok": False, "error": "group and folder_id are required"}), 400
 
@@ -459,6 +482,11 @@ def scan():
         else:
             ignored.append(f)
     audio_all_ids = {f["id"] for f in audio}
+    # Every mirror folder this scan can publish into, changed or not. The Hub
+    # reads this to show new subfolders without anybody typing their names.
+    folders_in_scan = sorted(
+        {_project_from_path(f.get("rel_path", []), prefix) for f in pdfs + audio}
+    )
     audio, lossless_skipped = media.prefer_compressed(audio)
     seen_ids = {f["id"] for f in pdfs} | audio_all_ids
 
@@ -544,7 +572,7 @@ def scan():
     for f in pdfs:
         if _skip(f):
             continue
-        project = _project_from_path(f.get("rel_path", []))
+        project = _project_from_path(f.get("rel_path", []), prefix)
         entry = {
             "group": group,
             "project": project,
@@ -600,7 +628,7 @@ def scan():
     for f in audio:
         if _skip(f):
             continue
-        project = _project_from_path(f.get("rel_path", []))
+        project = _project_from_path(f.get("rel_path", []), prefix)
         ext = media.ext_of(f["name"])
         entry = {
             "group": group,
@@ -653,7 +681,17 @@ def scan():
     except store.Conflict:
         pass  # another scan updated it; the cache is an optimisation, not truth
 
-    flagged = librarian.mark_missing_at_source(group, seen_ids)
+    # Only this scan's own folders can be judged: a file of ANOTHER concert in
+    # the same group was never going to be seen by this walk.
+    if prefix:
+        def _in_scope(project: str) -> bool:
+            return project == prefix or project.startswith(prefix + "/")
+    else:
+        scope = set(folders_in_scan)
+
+        def _in_scope(project: str) -> bool:
+            return project in scope
+    flagged = librarian.mark_missing_at_source(group, seen_ids, _in_scope)
 
     return jsonify(
         {
@@ -661,6 +699,8 @@ def scan():
             "group": group,
             "pdfs_in_folder": len(pdfs),
             "audio_in_folder": len(audio),
+            "project_prefix": prefix,
+            "folders_in_scan": folders_in_scan,
             "lossless_skipped": [f["name"] for f in lossless_skipped],
             "ignored": [
                 {"name": f.get("name"), "mimeType": f.get("mimeType")} for f in ignored
