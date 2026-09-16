@@ -82,7 +82,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.7.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.7.1"})
 
 
 @app.get("/drive/folders")
@@ -503,6 +503,36 @@ def scan():
     results = []
     counters = {"unchanged": 0, "examined": 0, "remaining": 0}
 
+    # v0.7.1 - a file MOVED in Drive keeps its file id, bytes and modified
+    # time, so the cursor below skips it and nothing would ever notice. Look
+    # for moves first, for every walked file. The published object does not
+    # move (R2 - a singer's device holds that path); the work records the
+    # folder it now sits in, and the Hub groups it by that.
+    by_source = {}
+    for work in registry["works"].values():
+        if work["group"] != group or not work["versions"]:
+            continue
+        current = next((v for v in work["versions"] if v["n"] == work["current"]), None)
+        if current and current.get("source_file_id"):
+            by_source[current["source_file_id"]] = work
+    moves = {}
+    for f in pdfs + audio:
+        work = by_source.get(f["id"])
+        if work is None:
+            continue
+        now = _project_from_path(f.get("rel_path", []), prefix)
+        if now != work.get("folder", work["project"]):
+            moves[work["work_id"]] = now
+    moved = librarian.record_folders(moves) if moves else []
+
+    def _same_file_same_bytes(f, sha) -> bool:
+        """The very file already published, unchanged - wherever it now sits."""
+        work = by_source.get(f["id"])
+        if work is None:
+            return False
+        current = next((v for v in work["versions"] if v["n"] == work["current"]), None)
+        return bool(current) and current.get("content_sha") == sha
+
     def _skip(f) -> bool:
         cached = cursors["files"].get(f["id"])
         if (
@@ -599,6 +629,11 @@ def scan():
                 continue
 
             sha = fingerprint.content_sha(local)
+            if _same_file_same_bytes(f, sha):
+                _remember(f, sha)
+                results.append({**entry, "outcome": "duplicate",
+                                "why": "the same Drive file, unchanged"})
+                continue
             proposal = librarian.match(
                 inspected, sha, f["name"], group, project, registry
             )
@@ -650,6 +685,11 @@ def scan():
             sha = fingerprint.content_sha(local)
             size = os.path.getsize(local)
             entry["source_size"] = size
+            if _same_file_same_bytes(f, sha):
+                _remember(f, sha)
+                results.append({**entry, "media": media.AUDIO, "outcome": "duplicate",
+                                "why": "the same Drive file, unchanged"})
+                continue
             proposal = librarian.match_audio(sha, f["id"], f["name"], group, project, registry)
 
             if proposal["decision"] == "duplicate":
@@ -709,6 +749,7 @@ def scan():
             "examined": counters["examined"],
             "not_examined_this_run": counters["remaining"],
             "published_now": sum(1 for r in results if r.get("outcome") == "published"),
+            "moved": moved,
             "missing_at_source": flagged,
             "results": results,
             "seconds": round(time.time() - started, 1),

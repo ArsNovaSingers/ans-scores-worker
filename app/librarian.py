@@ -439,6 +439,34 @@ def mark_missing_at_source(group: str, seen_file_ids: set[str], in_scope=None) -
     raise RuntimeError("registry is being written too fast to make progress")
 
 
+def record_folders(moves: dict) -> list[dict]:
+    """
+    Note the Drive folder each work now sits in. {work_id: folder}.
+
+    Display only. The published path is frozen (R2) and is not touched: this is
+    what lets a person regroup files on the Hub by moving them in Drive without
+    changing the file a singer's device already holds.
+    """
+    for _attempt in range(5):
+        registry, gen = load_registry()
+        done = []
+        for work_id, folder in moves.items():
+            work = registry["works"].get(work_id)
+            if work is None:
+                continue
+            if folder == work["project"]:
+                work.pop("folder", None)
+            else:
+                work["folder"] = folder
+            done.append({"work_id": work_id, "canonical": work["canonical"], "folder": folder})
+        try:
+            store.write_json(store.REGISTRY_PATH, registry, gen)
+            return done
+        except store.Conflict:
+            continue
+    raise RuntimeError("registry is being written too fast to make progress")
+
+
 def rollback(work_id: str, to_version: int, actor: str = "unknown") -> dict:
     """
     Put an earlier version back in front of singers.
@@ -544,6 +572,9 @@ def library(group: str) -> list[dict]:
                 # Lets the Hub recognise a file someone already linked by hand
                 # from Drive, and show it once rather than twice.
                 "source_file_id": current.get("source_file_id", ""),
+                # v0.7.1: where the file sits in Drive NOW, which can differ
+                # from `project` (where it was first published) after a move.
+                "folder": work.get("folder", work["project"]),
                 "object_path": store.work_published_path(work),
             }
         )

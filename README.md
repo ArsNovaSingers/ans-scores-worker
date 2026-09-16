@@ -135,6 +135,15 @@ scan's own folders; a scan of one concert no longer flags another's.
 
 WebDAV serves the tree as deep as it goes.
 
+### Moves (v0.7.1)
+
+A file moved in Drive keeps its id, bytes and modified time, so the cursor
+would never notice. Every scan now compares each walked file with the work it
+was published as and records the folder it sits in now (`folder` on the work
+and on `/library` rows; `moved` in the scan response). The published path does
+not move (R2). The same Drive file with the same bytes is always a duplicate,
+wherever it sits.
+
 ### Publishing
 
 ```
