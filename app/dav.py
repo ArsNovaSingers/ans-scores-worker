@@ -50,7 +50,7 @@ from xml.sax.saxutils import escape
 
 from flask import Response, request, stream_with_context
 
-from . import store
+from . import media, store
 
 DAV_ROOT = "/dav"
 CHUNK = 262144
@@ -225,7 +225,7 @@ def _file(href: str, name: str, meta: dict) -> str:
         "<D:displayname>{name}</D:displayname>"
         "<D:resourcetype/>"
         "<D:getcontentlength>{size}</D:getcontentlength>"
-        "<D:getcontenttype>application/pdf</D:getcontenttype>"
+        "<D:getcontenttype>{ctype}</D:getcontenttype>"
         "<D:getlastmodified>{mtime}</D:getlastmodified>"
         "<D:getetag>&quot;{etag}&quot;</D:getetag>"
         "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
@@ -233,6 +233,7 @@ def _file(href: str, name: str, meta: dict) -> str:
         href=escape(href),
         name=escape(name),
         size=int(meta.get("size") or 0),
+        ctype=escape(media.content_type(media.ext_of(name))),
         mtime=escape(_httpdate(meta.get("updated"))),
         etag=escape(str(meta.get("md5") or "")),
     )
@@ -306,7 +307,7 @@ def _get(segments: list[str], groups: list[str]) -> Response:
     size = int(meta.get("size") or 0)
 
     headers = {
-        "Content-Type": "application/pdf",
+        "Content-Type": media.content_type(media.ext_of(name)),
         "Last-Modified": _httpdate(meta.get("updated")),
         "ETag": '"{}"'.format(meta.get("md5") or ""),
         # Ranges are honoured, and saying so is half the feature: a client

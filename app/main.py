@@ -23,7 +23,7 @@ import time
 
 from flask import Flask, jsonify, request
 
-from . import dav, drive, fingerprint, librarian, naming, optimise, store
+from . import dav, drive, fingerprint, librarian, media, naming, optimise, store
 
 app = Flask(__name__)
 
@@ -60,7 +60,7 @@ def _project_from_path(rel_path: list[str]) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.5.1"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.6.0"})
 
 
 @app.get("/drive/folders")
@@ -146,6 +146,8 @@ def optimise_staged():
         return jsonify({"ok": False, "error": "no such staged item"}), 404
     if item.get("state") != "pending":
         return jsonify({"ok": False, "error": "that item is already " + str(item.get("state"))}), 400
+    if (item.get("inspected") or {}).get("media", media.PDF) != media.PDF:
+        return jsonify({"ok": False, "error": "only a PDF can be optimised"}), 400
 
     spath = item.get("staging_path") or ""
     if not spath or not store.object_exists(spath):
@@ -266,6 +268,8 @@ def optimise_scan():
             continue
         if not work.get("versions"):
             continue
+        if work.get("media", media.PDF) != media.PDF:
+            continue  # optimisation is a PDF operation
         if work_id in pending_works:
             results.append({"canonical": work["canonical"], "outcome": "already in the queue"})
             continue
@@ -274,7 +278,7 @@ def optimise_scan():
             continue
         examined += 1
 
-        ppath = store.published_path(work["group"], work["project"], work["canonical"])
+        ppath = store.work_published_path(work)
         if not store.object_exists(ppath):
             results.append({"canonical": work["canonical"], "outcome": "no published object"})
             continue
@@ -402,9 +406,25 @@ def scan():
     """
     Walk a group's Drive folder and stage anything new or changed.
 
-    Never publishes. Never deletes. The most this call can do to what singers
-    see is nothing at all - it produces questions, and a human answers them
-    at /publish.
+    Scores and, since v0.6.0, recordings. Everything else in the folder is
+    counted and reported, never silently dropped.
+
+    Never publishes on its own account. The caller may ask for two narrow kinds
+    of publish to happen in the same call, and nothing else:
+
+        auto_publish.audio              a recording whose identity is certain -
+                                        new, or the same Drive file with new
+                                        bytes. There is no annotation layer on
+                                        audio for a wrong call to damage.
+        auto_publish.new_work_projects  a PDF in one of these project folders
+                                        that matches NOTHING already published.
+                                        Meant for rehearsal notes: a new dated
+                                        note is always a new work, and waiting
+                                        for a human is why the 9/10 note never
+                                        reached anyone.
+
+    A PDF that might be an edition of an existing score is ALWAYS left for a
+    human. R4 is about that case, and it is untouched.
     """
     if not _authorised():
         return _deny()
@@ -413,6 +433,12 @@ def scan():
     group = (body.get("group") or "").strip()
     folder_id = (body.get("folder_id") or "").strip()
     limit = int(body.get("limit") or DEFAULT_SCAN_LIMIT)
+    auto = body.get("auto_publish") or {}
+    auto_audio = bool(auto.get("audio"))
+    auto_projects = {
+        str(p).strip().lower() for p in (auto.get("new_work_projects") or []) if str(p).strip()
+    }
+    actor = str(body.get("actor") or "scan")
     if not group or not folder_id:
         return jsonify({"ok": False, "error": "group and folder_id are required"}), 400
 
@@ -423,8 +449,18 @@ def scan():
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": "drive walk failed", "detail": str(exc)}), 502
 
-    pdfs = [f for f in files if f.get("mimeType") == "application/pdf"]
-    seen_ids = {f["id"] for f in pdfs}
+    pdfs, audio, ignored = [], [], []
+    for f in files:
+        kind = media.classify(f)
+        if kind == media.PDF:
+            pdfs.append(f)
+        elif kind == media.AUDIO:
+            audio.append(f)
+        else:
+            ignored.append(f)
+    audio_all_ids = {f["id"] for f in audio}
+    audio, lossless_skipped = media.prefer_compressed(audio)
+    seen_ids = {f["id"] for f in pdfs} | audio_all_ids
 
     cursors, cursor_gen = store.read_json(store.CURSORS_PATH, {"files": {}})
     cursors.setdefault("files", {})
@@ -437,27 +473,77 @@ def scan():
     }
 
     results = []
-    unchanged = 0
-    examined = 0
-    remaining = 0
+    counters = {"unchanged": 0, "examined": 0, "remaining": 0}
 
-    for f in pdfs:
+    def _skip(f) -> bool:
         cached = cursors["files"].get(f["id"])
         if (
             cached
             and cached.get("md5") == f.get("md5Checksum")
             and cached.get("modifiedTime") == f.get("modifiedTime")
         ):
-            unchanged += 1
-            continue
+            counters["unchanged"] += 1
+            return True
         if f["id"] in already_pending:
-            unchanged += 1
-            continue
-        if examined >= limit:
-            remaining += 1
-            continue
+            counters["unchanged"] += 1
+            return True
+        if counters["examined"] >= limit:
+            counters["remaining"] += 1
+            return True
+        counters["examined"] += 1
+        return False
 
-        examined += 1
+    def _remember(f, sha):
+        cursors["files"][f["id"]] = {
+            "md5": f.get("md5Checksum"),
+            "modifiedTime": f.get("modifiedTime"),
+            "content_sha": sha,
+        }
+
+    def _stage(entry, sha, inspected, proposal, local, ext):
+        staging_id = librarian.stage(
+            {
+                **entry,
+                "content_sha": sha,
+                "inspected": inspected,
+                "proposal": proposal,
+                "staging_path": "",  # filled below once we know the id
+            }
+        )
+        spath = store.staging_path(staging_id, ext)
+        store.upload_file(
+            local, spath, {"staging_id": staging_id, "sha256": sha},
+            content_type=media.content_type(ext),
+        )
+        for _attempt in range(5):
+            stg, gen = librarian.load_staging()
+            stg["items"][staging_id]["staging_path"] = spath
+            try:
+                store.write_json(store.STAGING_PATH, stg, gen)
+                break
+            except store.Conflict:
+                continue
+        return staging_id
+
+    def _auto(staging_id, proposal, row):
+        try:
+            done = librarian.publish(
+                staging_id=staging_id,
+                decision=proposal["decision"],
+                work_id=proposal.get("work_id"),
+                canonical=proposal.get("proposed_canonical"),
+                actor=actor,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad publish must not end the scan
+            row["outcome"] = "staged"
+            row["auto_publish_failed"] = str(exc)
+            return
+        row["outcome"] = "published"
+        row["published"] = done
+
+    for f in pdfs:
+        if _skip(f):
+            continue
         project = _project_from_path(f.get("rel_path", []))
         entry = {
             "group": group,
@@ -490,41 +576,77 @@ def scan():
             )
 
             if proposal["decision"] == "duplicate":
-                cursors["files"][f["id"]] = {
-                    "md5": f.get("md5Checksum"),
-                    "modifiedTime": f.get("modifiedTime"),
-                    "content_sha": sha,
-                }
+                _remember(f, sha)
                 results.append({**entry, "outcome": "duplicate", "why": proposal["why"]})
                 continue
 
-            staging_id = librarian.stage(
-                {
-                    **entry,
-                    "content_sha": sha,
-                    "inspected": inspected,
-                    "proposal": proposal,
-                    "staging_path": "",  # filled below once we know the id
-                }
-            )
-            spath = store.staging_path(staging_id)
-            store.upload_file(local, spath, {"staging_id": staging_id, "sha256": sha})
+            staging_id = _stage(entry, sha, inspected, proposal, local, "pdf")
+            row = {
+                **entry,
+                "media": media.PDF,
+                "outcome": "staged",
+                "staging_id": staging_id,
+                "pages": inspected["page_count"],
+                "fingerprint": inspected["edition_method"],
+                "proposal": proposal,
+            }
+            if proposal["decision"] == "new_work" and project.strip().lower() in auto_projects:
+                _auto(staging_id, proposal, row)
+                if row["outcome"] == "published":
+                    _remember(f, sha)
+                    registry, _gen = librarian.load_registry()
+            results.append(row)
 
-            # Record the object path now that it exists.
-            stg, gen = librarian.load_staging()
-            stg["items"][staging_id]["staging_path"] = spath
-            store.write_json(store.STAGING_PATH, stg, gen)
+    for f in audio:
+        if _skip(f):
+            continue
+        project = _project_from_path(f.get("rel_path", []))
+        ext = media.ext_of(f["name"])
+        entry = {
+            "group": group,
+            "project": project,
+            "source_file_id": f["id"],
+            "source_name": f["name"],
+            "source_size": int(f.get("size") or 0),
+            "source_modified": f.get("modifiedTime"),
+        }
 
-            results.append(
-                {
-                    **entry,
-                    "outcome": "staged",
-                    "staging_id": staging_id,
-                    "pages": inspected["page_count"],
-                    "fingerprint": inspected["edition_method"],
-                    "proposal": proposal,
-                }
-            )
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "candidate." + ext)
+            try:
+                drive.download(f["id"], local, svc)
+            except Exception as exc:  # noqa: BLE001
+                results.append({**entry, "outcome": "download_failed", "detail": str(exc)})
+                continue
+
+            sha = fingerprint.content_sha(local)
+            size = os.path.getsize(local)
+            entry["source_size"] = size
+            proposal = librarian.match_audio(sha, f["id"], f["name"], group, project, registry)
+
+            if proposal["decision"] == "duplicate":
+                _remember(f, sha)
+                results.append({**entry, "media": media.AUDIO, "outcome": "duplicate",
+                                "why": proposal["why"]})
+                continue
+
+            inspected = media.inspected_for_audio(ext, size, sha)
+            staging_id = _stage(entry, sha, inspected, proposal, local, ext)
+            row = {
+                **entry,
+                "media": media.AUDIO,
+                "outcome": "staged",
+                "staging_id": staging_id,
+                "proposal": proposal,
+            }
+            if auto_audio and proposal["decision"] in ("new_work", "new_edition"):
+                _auto(staging_id, proposal, row)
+                if row["outcome"] == "published":
+                    _remember(f, sha)
+                    # The next file in this folder must see this one, or two
+                    # uploads with one name would both claim it.
+                    registry, _gen = librarian.load_registry()
+            results.append(row)
 
     try:
         store.write_json(store.CURSORS_PATH, cursors, cursor_gen)
@@ -538,9 +660,15 @@ def scan():
             "ok": True,
             "group": group,
             "pdfs_in_folder": len(pdfs),
-            "unchanged_since_last_scan": unchanged,
-            "examined": examined,
-            "not_examined_this_run": remaining,
+            "audio_in_folder": len(audio),
+            "lossless_skipped": [f["name"] for f in lossless_skipped],
+            "ignored": [
+                {"name": f.get("name"), "mimeType": f.get("mimeType")} for f in ignored
+            ],
+            "unchanged_since_last_scan": counters["unchanged"],
+            "examined": counters["examined"],
+            "not_examined_this_run": counters["remaining"],
+            "published_now": sum(1 for r in results if r.get("outcome") == "published"),
             "missing_at_source": flagged,
             "results": results,
             "seconds": round(time.time() - started, 1),
@@ -595,7 +723,7 @@ def staging_url(staging_id):
         registry, _rgen = librarian.load_registry()
         work = registry["works"].get(work_id)
         if work:
-            ppath = store.published_path(work["group"], work["project"], work["canonical"])
+            ppath = store.work_published_path(work)
             if store.object_exists(ppath):
                 out["current_url"] = store.signed_url(ppath)
                 out["current_path"] = ppath
@@ -668,7 +796,7 @@ def verify():
             continue
         checked += 1
         current = next(v for v in work["versions"] if v["n"] == work["current"])
-        ppath = store.published_path(work["group"], work["project"], work["canonical"])
+        ppath = store.work_published_path(work)
         if not store.object_exists(ppath):
             problems.append({"canonical": work["canonical"], "problem": "published file is missing"})
             continue

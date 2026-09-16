@@ -3,8 +3,12 @@ The mirror, and the small amount of state that describes it.
 
 Layout in the bucket:
 
-    scores/{group}/{project}/{canonical}.pdf   what singers read. Name is frozen
-    _versions/{work_id}/{n}/{canonical}.pdf    every version ever published
+    scores/{group}/{project}/{canonical}.{ext} what singers read. Name is frozen
+    _versions/{work_id}/{n}/{canonical}.{ext}  every version ever published
+
+{ext} is "pdf" for scores and the recording's own extension for audio
+(v0.6.0). A work with no "ext" on record is a score published before audio
+existed, and reads as "pdf" - so every path already in the bucket is unchanged.
     _registry/works.json                       work records and their frozen names
     _state/staging.json                        what is waiting for a human
     _state/cursors.json                        where the last Drive walk got to
@@ -82,19 +86,30 @@ def write_json(path: str, value, generation: int) -> int:
     return blob.generation
 
 
-def published_path(group: str, project: str, canonical: str) -> str:
-    return "scores/{}/{}/{}.pdf".format(group, project, canonical)
+def published_path(group: str, project: str, canonical: str, ext: str = "pdf") -> str:
+    return "scores/{}/{}/{}.{}".format(group, project, canonical, ext or "pdf")
 
 
-def version_path(work_id: str, n: int, canonical: str) -> str:
-    return "_versions/{}/{}/{}.pdf".format(work_id, n, canonical)
+def version_path(work_id: str, n: int, canonical: str, ext: str = "pdf") -> str:
+    return "_versions/{}/{}/{}.{}".format(work_id, n, canonical, ext or "pdf")
 
 
-def upload_file(local_path: str, object_path: str, metadata: dict | None = None) -> str:
+def work_ext(work: dict) -> str:
+    """A work's file extension. Absent means a score from before v0.6.0."""
+    return str(work.get("ext") or "pdf")
+
+
+def work_published_path(work: dict) -> str:
+    """Where singers read this work. Use this rather than rebuilding the path by hand."""
+    return published_path(work["group"], work["project"], work["canonical"], work_ext(work))
+
+
+def upload_file(local_path: str, object_path: str, metadata: dict | None = None,
+                content_type: str = "application/pdf") -> str:
     blob = bucket().blob(object_path)
     if metadata:
         blob.metadata = {k: str(v) for k, v in metadata.items()}
-    blob.upload_from_filename(local_path, content_type="application/pdf")
+    blob.upload_from_filename(local_path, content_type=content_type)
     blob.reload()
     return blob.md5_hash or ""
 
@@ -107,13 +122,13 @@ def copy_object(src_path: str, dst_path: str, metadata: dict | None = None) -> N
         copied.patch()
 
 
-def staging_path(staging_id: str) -> str:
+def staging_path(staging_id: str, ext: str = "pdf") -> str:
     """
     Where a candidate waits between the scan that found it and the human who
     decides about it. Cloud Run instances are ephemeral, so /tmp cannot hold it:
     a scan and its publish are different requests and may be different machines.
     """
-    return "_staging/{}.pdf".format(staging_id)
+    return "_staging/{}.{}".format(staging_id, ext or "pdf")
 
 
 def object_exists(object_path: str) -> bool:
