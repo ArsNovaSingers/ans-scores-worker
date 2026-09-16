@@ -404,7 +404,7 @@ def _close_staging(staging_id: str, state: str, actor: str, extra: dict) -> dict
     raise RuntimeError("staging is being written too fast to make progress")
 
 
-def mark_missing_at_source(group: str, seen_file_ids: set[str]) -> list[dict]:
+def mark_missing_at_source(group: str, seen_file_ids: set[str], in_scope=None) -> list[dict]:
     """
     R1. A file gone from Drive is never removed from the mirror - it is
     flagged, and the flag is what Tom sees. Nothing about a singer's device
@@ -416,6 +416,8 @@ def mark_missing_at_source(group: str, seen_file_ids: set[str]) -> list[dict]:
         changed = False
         for work in registry["works"].values():
             if work["group"] != group:
+                continue
+            if in_scope is not None and not in_scope(work["project"]):
                 continue
             current = next((v for v in work["versions"] if v["n"] == work["current"]), None)
             if current is None:
