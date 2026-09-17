@@ -57,6 +57,11 @@ currently does and this service does not.
 
 | Method | Path | Does |
 |---|---|---|
+| POST | `/takes/setup` | v0.8.0 - apply the takes bucket's CORS rules (from `app/takes.py`) |
+| POST | `/takes/upload-url` | v0.8.0 - signed PUT URL for `takes/{staging\|live}/u{id}/{take}.{mp3\|wav}` |
+| POST | `/takes/stat` | v0.8.0 - does a take exist, and how big is it |
+| POST | `/takes/url` | v0.8.0 - fresh signed read URL (`download: true` sets the save-as name) |
+| POST | `/takes/delete` | v0.8.0 - delete one take (the singer asked) |
 | GET | `/health` | liveness, no auth |
 | GET | `/whoami` | which identity Drive is being read as, and which bucket |
 | POST | `/scan` | walk a group's folder, stage anything new or changed |
@@ -213,3 +218,16 @@ growing here to disagree with the first one.
 
 Optimisation and Tom's approval queue (Phase 2), singer-facing delivery
 (Phase 3), the pilot (Phase 4), WebDAV (Phase 5), quiet hours (Phase 6).
+
+## Practice takes (v0.8.0)
+
+A second, separate private bucket (`TAKES_BUCKET`, default
+`ars-nova-practice-takes`) holds singers' practice takes, uploaded straight from
+the browser through signed URLs this service issues - Cloud Run cannot accept a
+request body over 32 MiB, and a long WAV mixdown is bigger than that. WordPress
+(the Ars Nova Practice add-on) decides who may upload, play or delete a take;
+this service only checks the token and the path shape. **R1 does not apply to
+this bucket** - deleting a take is the singer's right - and `store.py` still has
+no delete call. CORS for the bucket lives in `app/takes.py` and is applied with
+`POST /takes/setup`; the service account needs `roles/storage.admin` on that
+bucket only.

@@ -23,7 +23,7 @@ import time
 
 from flask import Flask, jsonify, request
 
-from . import dav, drive, fingerprint, librarian, media, naming, optimise, store
+from . import dav, drive, fingerprint, librarian, media, naming, optimise, store, takes
 
 app = Flask(__name__)
 
@@ -51,6 +51,10 @@ def _authorised() -> bool:
 
 def _deny():
     return jsonify({"ok": False, "error": "unauthorised"}), 401
+
+
+# Practice takes (v0.8.0): signed upload/read URLs for a separate private bucket.
+takes.register(app, _authorised, _deny)
 
 
 def _project_from_path(rel_path: list[str], prefix: str = "") -> str:
@@ -82,7 +86,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.7.1"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.8.0"})
 
 
 @app.get("/drive/folders")
