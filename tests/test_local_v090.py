@@ -323,6 +323,27 @@ check("Claude Test Concert/PDFs" in res["folders_in_scan"], "folders_in_scan rep
 lib = {r["canonical"]: r for r in get("/library/claude-test?urls=0")[1]["scores"]}
 check(lib["BigScore"]["project"] == "Claude Test Concert" and lib["BigScore"]["folder"] == "Claude Test Concert/PDFs",
       "published path unchanged (frozen), folder reports PDFs")
+# 11. v0.9.2: a score optimised AFTER publishing (/optimise/scan) keeps its Drive
+# link, so renaming its folder is a move - not a lost score, not a re-stage.
+big2 = os.path.join(TMP, "BigTwo.pdf")
+score_pdf(big2, 9, True, "BigTwo")
+FILES["f-big2"] = {"root": "B", "name": "BigTwo.pdf", "rel_path": ["PDFs"], "path": big2}
+librarian.BIG_FILE_BYTES, keep_big = 10 ** 12, librarian.BIG_FILE_BYTES  # stage unoptimised, as before v0.9
+code, res = post("/scan", {"group": "g2", "folder_id": "B", "project_prefix": "Concert Two"})
+librarian.BIG_FILE_BYTES = keep_big
+r = res["results"][0]
+code, res = post("/publish", {"staging_id": r["staging_id"], "decision": "new_work", "canonical": "BigTwo", "allow_large": True})
+w2 = res["work_id"]
+code, res = post("/optimise/scan", {"group": "g2", "work_ids": [w2]})
+code, res = post("/publish", {"staging_id": res["results"][0]["staging_id"], "decision": "new_edition", "work_id": w2})
+check(res["ok"] and res["version"] == 2, "published score optimised as edition v2 (source optimise:...)")
+FILES["f-big2"]["rel_path"] = ["01 Scores"]
+OBJ.pop(store.CURSORS_PATH, None)
+code, res = post("/scan", {"group": "g2", "folder_id": "B", "project_prefix": "Concert Two"})
+check(any(m["work_id"] == w2 and m["folder"] == "Concert Two/01 Scores" for m in res["moved"]), "folder rename recorded as a move for the optimised score")
+check(res["results"] and res["results"][0]["outcome"] == "duplicate", "unchanged original is a duplicate, not re-staged")
+check(get("/library/g2?urls=0")[1]["scores"][0]["folder"] == "Concert Two/01 Scores", "library reports the new folder")
+
 code, res = get("/health")
-check(res["version"] == "0.9.1", "health reports 0.9.1")
+check(res["version"] == "0.9.2", "health reports 0.9.2")
 print("\nALL %d CHECKS PASSED" % ok)

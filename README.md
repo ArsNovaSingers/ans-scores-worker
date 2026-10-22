@@ -270,3 +270,11 @@ items and new works as `folder`, in `folders_in_scan`, and in move detection.
 The Hub names its headings after the folder exactly as named, so a `PDFs` folder
 shows "PDFs". Existing works pick up their real folder on the next scan, as a
 move; nothing is republished.
+
+## v0.9.2: optimised editions keep their Drive link
+
+An edition made by `/optimise/scan` records its source as `optimise:<work>`. The scan traced a
+work to its Drive file through the current version only, so after optimisation a folder rename
+was not recorded as a move and the Hub lost the score (LIVE, 2026-10-22, about 4 minutes). A work
+is now traced through its newest version that came from Drive, and any version taken from the
+same file with the same bytes counts as unchanged. Regression test 11 fails on 0.9.1.

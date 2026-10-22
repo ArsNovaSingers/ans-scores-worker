@@ -104,7 +104,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.1"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.2"})
 
 
 @app.get("/drive/folders")
@@ -560,13 +560,20 @@ def scan():
     # for moves first, for every walked file. The published object does not
     # move (R2 - a singer's device holds that path); the work records the
     # folder it now sits in, and the Hub groups it by that.
+    # v0.9.2: a work is traced to the Drive file of its newest version that
+    # CAME from Drive. An edition made by /optimise/scan records its source as
+    # "optimise:<work>", and keying on the current version alone lost the
+    # Drive link for every optimised score - on 2026-10-22 a folder rename then
+    # left five scores unmoved and off the Hub until this was fixed.
     by_source = {}
     for work in registry["works"].values():
         if work["group"] != group or not work["versions"]:
             continue
-        current = next((v for v in work["versions"] if v["n"] == work["current"]), None)
-        if current and current.get("source_file_id"):
-            by_source[current["source_file_id"]] = work
+        for v in sorted(work["versions"], key=lambda x: x["n"], reverse=True):
+            sid = v.get("source_file_id") or ""
+            if sid and not sid.startswith("optimise:"):
+                by_source.setdefault(sid, work)
+                break
     moves = {}
     for f in pdfs + audio:
         work = by_source.get(f["id"])
@@ -582,8 +589,12 @@ def scan():
         work = by_source.get(f["id"])
         if work is None:
             return False
-        current = next((v for v in work["versions"] if v["n"] == work["current"]), None)
-        return bool(current) and sha in (current.get("content_sha"), current.get("source_sha"))
+        # Any version taken from this very file with these bytes - including
+        # the original an optimised edition now stands in for (v0.9.2).
+        return any(
+            v.get("source_file_id") == f["id"] and sha in (v.get("content_sha"), v.get("source_sha"))
+            for v in work["versions"]
+        )
 
     def _skip(f) -> bool:
         cached = cursors["files"].get(f["id"])
