@@ -516,6 +516,8 @@ def _link_existing(item: dict, staging_id: str, work_id: str | None, canonical: 
         "current": 0,
         "alias_of": target["work_id"],
         "source_missing": False,
+        # v0.9.3: the alias's own Drive file, so a folder rename moves it.
+        "source_file_id": item["source_file_id"],
     }
     if item.get("folder") and item["folder"] != item["project"]:
         alias["folder"] = item["folder"]
@@ -613,6 +615,7 @@ def merge_works(keep: str, merge: str, current: str = "", actor: str = "unknown"
     if dry_run:
         return {"dry_run": True, **plan}
 
+    b_versions_before, b_current_n = list(b["versions"]), b["current"]
     a["versions"] = history
     a["current"] = new_current
     a.setdefault("merges", []).append({"merged": merge, "at": _now(), "by": actor})
@@ -620,6 +623,11 @@ def merge_works(keep: str, merge: str, current: str = "", actor: str = "unknown"
     b["current"] = 0
     b["alias_of"] = keep
     b["merged_into"] = keep
+    # v0.9.3: remember the merged work's own Drive file before its versions
+    # move to `keep`, so a later folder rename still moves this path.
+    b_current = next((v for v in b_versions_before if v["n"] == b_current_n), None)
+    if b_current and not str(b_current.get("source_file_id", "")).startswith("optimise:"):
+        b["source_file_id"] = b_current.get("source_file_id", "")
     b["merged_at"] = _now()
 
     meta = {"work_id": keep, "version": new_current, "content_sha": chosen["content_sha"],

@@ -278,3 +278,11 @@ work to its Drive file through the current version only, so after optimisation a
 was not recorded as a move and the Hub lost the score (LIVE, 2026-10-22, about 4 minutes). A work
 is now traced through its newest version that came from Drive, and any version taken from the
 same file with the same bytes counts as unchanged. Regression test 11 fails on 0.9.1.
+
+## v0.9.3: aliases follow folder moves
+
+An alias (a shared or merged copy) has no versions of its own, so the scan could not trace it
+to its Drive file and a folder rename left it behind (Bernstein in Sound & Motion, LIVE
+2026-10-22). An alias now records its own Drive file (link_existing, merge); for a merge made
+before 0.9.3 it is found through the versions merged in from it. Rehearsed against a copy of
+LIVE's registry: 0.9.2 moved 5 of 6 Sound & Motion scores (the LIVE result), 0.9.3 moves 6 of 6.
