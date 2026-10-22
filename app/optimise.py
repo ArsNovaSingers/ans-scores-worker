@@ -9,9 +9,16 @@ claude/portal/PDF_Optimisation_Measured_2026-08-27.md.
 
 WHAT IT DOES NOT DO
 
-It does not publish. Per Jonathan's 2026-08-25 ruling and Device_Sync_Spec
-3.5, optimisation is offered and never applied: a candidate is built, measured
-and parked, and Tom says yes or no per file. This module builds and measures.
+It does not publish. This module builds and measures; a person still approves
+what publishes.
+
+WHEN IT RUNS: until v0.9.0 optimisation was only ever offered (Jonathan's
+2026-08-25 ruling, Device_Sync_Spec 3.5). On 2026-10-22 Jonathan reversed that
+for intake: /scan now applies it AUTOMATICALLY to any PDF over 30 MB before
+staging, because 44-70 MB scores reached singers through a path that skipped
+the Optimize button. The gates below decide whether the smaller copy is used;
+a candidate that fails them is never used, and the original is staged instead.
+/optimise/scan still OFFERS smaller copies of files published before that.
 Publishing an approved candidate is librarian.publish_optimised(), which goes
 through the ordinary version machinery so the original stays retrievable (R3)
 and the published name never changes (R2).
