@@ -21,6 +21,11 @@ from . import fingerprint, media, naming, store
 # It is never enough to act on by itself.
 NAME_ASK_THRESHOLD = 0.82
 
+# v0.9.0 (HUB-52). A PDF above this is optimised on intake and refused at
+# publish unless allow_large is passed. 30 MB, because Cloud Run will not serve
+# a single response over 32 MiB, so a bigger score cannot be synced whole.
+BIG_FILE_BYTES = 30 * 1024 * 1024
+
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -36,6 +41,37 @@ def load_staging() -> tuple[dict, int]:
     stg, gen = store.read_json(store.STAGING_PATH, {"items": {}})
     stg.setdefault("items", {})
     return stg, gen
+
+
+def effective(work: dict, registry: dict) -> dict:
+    """
+    The work whose versions a work serves (v0.9.0).
+
+    An ALIAS is a work in a second project that shares another work's music:
+    the same piece used by two concerts, or two works that turned out to be
+    one piece and were merged. It keeps its own frozen published path (R2 -
+    singers' devices hold it) but has no versions of its own; every version
+    lands on the work it points at and is copied to the alias's path too. So
+    there is one version history, and approving an update from either
+    project updates both.
+    """
+    target = work.get("alias_of")
+    if target and target in registry["works"]:
+        return registry["works"][target]
+    return work
+
+
+def aliases_of(work_id: str, registry: dict) -> list[dict]:
+    return [w for w in registry["works"].values() if w.get("alias_of") == work_id]
+
+
+def _version_matches_bytes(version: dict, sha: str) -> bool:
+    """The published bytes, or (v0.9.0) the original they were optimised from."""
+    return bool(sha) and sha in (version.get("content_sha"), version.get("source_sha"))
+
+
+def _version_matches_edition(version: dict, key: str) -> bool:
+    return bool(key) and key in (version.get("edition_key"), version.get("source_edition_key"))
 
 
 def match(inspected: dict, content_sha: str, source_name: str, group: str,
@@ -58,9 +94,11 @@ def match(inspected: dict, content_sha: str, source_name: str, group: str,
     ]
 
     # 1. Bytes. Certain, and the commonest case on a re-scan of a folder.
+    # v0.9.0: compared with the original too, so a file optimised on the way
+    # in is still recognised when the unchanged original is scanned again.
     for work in candidates:
-        for version in work["versions"]:
-            if version["content_sha"] == content_sha:
+        for version in effective(work, registry)["versions"]:
+            if _version_matches_bytes(version, content_sha):
                 return {
                     "decision": "duplicate",
                     "work_id": work["work_id"],
@@ -72,7 +110,8 @@ def match(inspected: dict, content_sha: str, source_name: str, group: str,
     # 2. Edition key. Same music on the pages, whatever the file is called.
     edition_hits = [
         w for w in candidates
-        if any(v["edition_key"] == inspected["edition_key"] for v in w["versions"])
+        if any(_version_matches_edition(v, inspected["edition_key"])
+               for v in effective(w, registry)["versions"])
     ]
     if len(edition_hits) == 1:
         work = edition_hits[0]
@@ -88,6 +127,38 @@ def match(inspected: dict, content_sha: str, source_name: str, group: str,
         }
     if len(edition_hits) > 1:
         return _ambiguous(edition_hits, "several works share these pages")
+
+    # 2b. v0.9.0 (HUB-53). The same score already published for ANOTHER
+    # project of this group. Before this, a new concert re-using a piece minted
+    # a second work for it ("Bernstein Somewhere" twice), and an update to one
+    # never reached the other. Bytes or pages, never a name - and still only a
+    # proposal: approving it links this project to the existing piece.
+    elsewhere = []
+    for work in registry["works"].values():
+        if work["group"] != group or work["project"] == project or work.get("alias_of"):
+            continue
+        if not work["versions"]:
+            continue
+        hit_bytes = any(_version_matches_bytes(v, content_sha) for v in work["versions"])
+        hit_pages = any(_version_matches_edition(v, inspected["edition_key"]) for v in work["versions"])
+        if hit_bytes or hit_pages:
+            elsewhere.append((hit_bytes, work))
+    if len(elsewhere) == 1:
+        same_bytes, work = elsewhere[0]
+        return {
+            "decision": "link_existing",
+            "work_id": work["work_id"],
+            "canonical": work["canonical"],
+            "confidence": "certain" if same_bytes else "high",
+            "why": "this score is already published as {} in {} ({}). Linking it here makes "
+                   "the two projects share one piece and one version history.".format(
+                       work["canonical"], work["project"],
+                       "the same bytes" if same_bytes else "the same pages"),
+            "proposed_canonical": work["canonical"],
+            "structure_change": not _structure_ok(inspected, work),
+        }
+    if len(elsewhere) > 1:
+        return _ambiguous([w for _b, w in elsewhere], "this score is published in several projects")
 
     # 3. Name similarity, scoped to the project folder. Proposes only.
     scored = sorted(
@@ -199,19 +270,32 @@ def match_audio(content_sha: str, source_file_id: str, source_name: str,
 
 
 def _structure_ok(inspected: dict, work: dict) -> bool:
-    current = next(v for v in work["versions"] if v["n"] == work["current"])
+    current = next((v for v in work["versions"] if v["n"] == work["current"]), None)
+    if current is None:
+        return True  # an alias: the caller compares against the work it points at
     return fingerprint.structure_matches(current["structure"], inspected)
 
 
-def stage(entry: dict) -> str:
-    """Park a decision for a human. Returns the staging id."""
-    staging_id = uuid.uuid4().hex[:12]
+def new_staging_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def stage(entry: dict, staging_id: str | None = None, state: str = "pending") -> str:
+    """
+    Park a decision for a human. Returns the staging id.
+
+    v0.9.0: the caller may choose the id, so the file is stored BEFORE the
+    item is recorded - an item is never written with an empty staging_path
+    again (the 140.7 MB Ligeti case). state "error" records a file that could
+    not be stored, so a person sees it instead of a silent 500.
+    """
+    staging_id = staging_id or new_staging_id()
     for _attempt in range(5):
         staging, gen = load_staging()
         entry = dict(entry)
         entry["staging_id"] = staging_id
         entry["staged_at"] = _now()
-        entry["state"] = "pending"
+        entry["state"] = state
         staging["items"][staging_id] = entry
         try:
             store.write_json(store.STAGING_PATH, staging, gen)
@@ -223,7 +307,7 @@ def stage(entry: dict) -> str:
 
 def publish(staging_id: str, decision: str, work_id: str | None = None,
             canonical: str | None = None, accept_structure_change: bool = False,
-            actor: str = "unknown") -> dict:
+            actor: str = "unknown", allow_large: bool = False) -> dict:
     """
     Turn a staged item into a published version.
 
@@ -243,10 +327,44 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
     if decision == "reject":
         return _close_staging(staging_id, "rejected", actor, {})
 
+    # v0.9.0 (HUB-52). Refuse to send singers a PDF over the ceiling. Every
+    # path comes through here - the project screen, REST, a batch, a scan's
+    # auto-publish - so this is the one place the rule cannot be skipped.
+    item_media = item["inspected"].get("media", media.PDF)
+    if item_media == media.PDF and int(item.get("source_size") or 0) > BIG_FILE_BYTES and not allow_large:
+        raise ValueError(
+            "Refusing to publish {}: it is {:.1f} MB, over the {} MB ceiling. Optimise it first "
+            "(POST /optimise/staged), or repeat with allow_large=true to publish it as it is.".format(
+                item["source_name"], int(item["source_size"]) / 1048576.0, BIG_FILE_BYTES // 1048576)
+        )
+
+    # v0.9.0 (HUB-53). A file already published must not be published again
+    # as something new - a second click on a recording that auto-publish had
+    # already placed would have minted a duplicate work.
+    if decision in ("new_work", "link_existing"):
+        for other in registry["works"].values():
+            if other["group"] != item["group"]:
+                continue
+            for v in other["versions"]:
+                if v.get("source_file_id") == item["source_file_id"] and (
+                        _version_matches_bytes(v, item["content_sha"])
+                        or _version_matches_bytes(v, item.get("source_sha", ""))):
+                    raise ValueError(
+                        "{} is already published as {} (version {}). Nothing to add.".format(
+                            item["source_name"], other["canonical"], v["n"])
+                    )
+
+    if decision == "link_existing":
+        return _link_existing(item, staging_id, work_id, canonical, actor, registry, reg_gen)
+
     if decision == "new_edition":
         if not work_id or work_id not in registry["works"]:
             raise ValueError("new_edition needs a work_id that exists")
-        work = registry["works"][work_id]
+        # An update proposed against an alias lands on the work it points at.
+        work = effective(registry["works"][work_id], registry)
+        work_id = work["work_id"]
+        if any(v["content_sha"] == item["content_sha"] for v in work["versions"]):
+            raise ValueError("{} already has these exact bytes. Nothing to add.".format(work["canonical"]))
         current = next(v for v in work["versions"] if v["n"] == work["current"])
         structure_ok = fingerprint.structure_matches(current["structure"], item["inspected"])
         if not structure_ok and not accept_structure_change:
@@ -277,7 +395,7 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
         registry["works"][work_id] = work
         n = 1
     else:
-        raise ValueError("decision must be new_work, new_edition or reject")
+        raise ValueError("decision must be new_work, new_edition, link_existing or reject")
 
     item_ext = item["inspected"].get("ext", "pdf")
     if item_ext != store.work_ext(work):
@@ -304,12 +422,19 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
         "published_by": actor,
     }
 
+    if not item.get("staging_path") or not store.object_exists(item["staging_path"]):
+        raise ValueError("the staged file for {} is missing, so there is nothing to publish".format(
+            item["source_name"]))
+
     # 1. immutable version copy, taken from the staged object rather than local
     #    disk - the scan that produced it ran in a different request and may
     #    have run on a different instance.
     store.copy_object(item["staging_path"], vpath, meta)
-    # 2. only now move what singers read
+    # 2. only now move what singers read - the work's own path, and every
+    #    project that shares the piece (v0.9.0 aliases).
     store.copy_object(vpath, ppath, meta)
+    for alias in aliases_of(work_id, registry):
+        store.copy_object(vpath, store.work_published_path(alias), meta)
 
     work["versions"].append(
         {
@@ -323,6 +448,11 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
             },
             "source_file_id": item["source_file_id"],
             "source_name": item["source_name"],
+            # v0.9.0: the original's identity when the published bytes were
+            # optimised on the way in, so re-scanning the original matches.
+            "source_sha": item.get("source_sha") or item["content_sha"],
+            "source_edition_key": item.get("source_edition_key") or item["inspected"]["edition_key"],
+            "optimised": bool((item.get("optimisation") or {}).get("applied_before_publishing")),
             "published_at": _now(),
             "published_by": actor,
             "object_path": vpath,
@@ -350,6 +480,223 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
         "published_path": ppath,
         "version_path": vpath,
     }
+
+
+def _link_existing(item: dict, staging_id: str, work_id: str | None, canonical: str | None,
+                   actor: str, registry: dict, reg_gen: int) -> dict:
+    """
+    Publish a staged file as this project's copy of a piece another project
+    already has (v0.9.0). Creates an ALIAS work in this project's folder - its
+    own frozen published path, no versions of its own - and puts the shared
+    piece's current bytes there. The staged file itself is not published: it
+    was matched as the same music, and the shared version history decides.
+    """
+    if not work_id or work_id not in registry["works"]:
+        raise ValueError("link_existing needs the work_id of the piece to share")
+    target = effective(registry["works"][work_id], registry)
+    if target["group"] != item["group"]:
+        raise ValueError("a piece can only be shared within one group")
+    name = canonical or (item.get("proposal") or {}).get("proposed_canonical") or target["canonical"]
+    _assert_name_free(registry, item["group"], item["project"], name)
+    current = next(v for v in target["versions"] if v["n"] == target["current"])
+
+    alias_id = uuid.uuid4().hex[:12]
+    alias = {
+        "work_id": alias_id,
+        "group": item["group"],
+        "project": item["project"],
+        "media": target.get("media", media.PDF),
+        "ext": store.work_ext(target),
+        "canonical": name,
+        "created": _now(),
+        "versions": [],
+        "current": 0,
+        "alias_of": target["work_id"],
+        "source_missing": False,
+    }
+    ppath = store.work_published_path(alias)
+    store.copy_object(current["object_path"], ppath, {
+        "work_id": target["work_id"], "alias": alias_id, "version": current["n"],
+        "content_sha": current["content_sha"], "published_by": actor,
+    })
+    registry["works"][alias_id] = alias
+    for _attempt in range(5):
+        try:
+            store.write_json(store.REGISTRY_PATH, registry, reg_gen)
+            break
+        except store.Conflict:
+            registry, reg_gen = load_registry()
+            registry["works"][alias_id] = alias
+    else:
+        raise RuntimeError("registry is being written too fast to make progress")
+    _close_staging(staging_id, "published", actor, {"work_id": alias_id, "alias_of": target["work_id"]})
+    return {
+        "work_id": alias_id,
+        "alias_of": target["work_id"],
+        "canonical": name,
+        "version": current["n"],
+        "published_path": ppath,
+    }
+
+
+def merge_works(keep: str, merge: str, current: str = "", actor: str = "unknown",
+                dry_run: bool = True) -> dict:
+    """
+    Two works that are one piece (HUB-53: "Bernstein Somewhere" was published
+    twice). The work `keep` keeps its id and gains `merge`'s versions,
+    renumbered after its own; `merge` becomes an alias of it, so its frozen
+    published path still serves - every singer's device and every project
+    map that holds either id keeps working - and from now on both paths get
+    every new version.
+
+    Which version is current is a person's decision, never inferred:
+    current = "keep" (keep's current stays), "merge" (merge's current
+    becomes current), or a version number in the merged history.
+
+    Nothing is deleted (R1). Version objects stay where they were written.
+    """
+    registry, gen = load_registry()
+    a = registry["works"].get(keep)
+    b = registry["works"].get(merge)
+    if a is None or b is None:
+        raise KeyError("no such work: {}".format(keep if a is None else merge))
+    if keep == merge:
+        raise ValueError("keep and merge are the same work")
+    if a.get("alias_of") or b.get("alias_of"):
+        raise ValueError("merge two works, not an alias")
+    if a["group"] != b["group"]:
+        raise ValueError("works in different groups cannot be merged")
+    if store.work_ext(a) != store.work_ext(b):
+        raise ValueError("a .{} cannot be merged with a .{}".format(store.work_ext(a), store.work_ext(b)))
+    if current not in ("keep", "merge") and not str(current).isdigit():
+        raise ValueError("say which version becomes current: current='keep', 'merge', or a number")
+
+    base = max([v["n"] for v in a["versions"]] or [0])
+    moved = []
+    b_current_new = 0
+    for v in sorted(b["versions"], key=lambda x: x["n"]):
+        nv = dict(v)
+        nv["n"] = base + len(moved) + 1
+        nv["merged_from"] = {"work_id": merge, "n": v["n"]}
+        if v["n"] == b["current"]:
+            b_current_new = nv["n"]
+        moved.append(nv)
+
+    history = a["versions"] + moved
+    if current == "keep":
+        new_current = a["current"]
+    elif current == "merge":
+        new_current = b_current_new
+    else:
+        new_current = int(current)
+    chosen = next((v for v in history if v["n"] == new_current), None)
+    if chosen is None:
+        raise ValueError("version {} does not exist after the merge; versions: {}".format(
+            new_current, ", ".join(str(v["n"]) for v in history)))
+
+    plan = {
+        "keep": {"work_id": keep, "canonical": a["canonical"], "project": a["project"]},
+        "merge": {"work_id": merge, "canonical": b["canonical"], "project": b["project"]},
+        "versions_after": [
+            {"n": v["n"], "from": v.get("merged_from", {"work_id": keep, "n": v["n"]}),
+             "size": v.get("size"), "published_at": v.get("published_at")}
+            for v in history
+        ],
+        "current_after": new_current,
+        "serves_both_paths": [store.work_published_path(a), store.work_published_path(b)],
+    }
+    if dry_run:
+        return {"dry_run": True, **plan}
+
+    a["versions"] = history
+    a["current"] = new_current
+    a.setdefault("merges", []).append({"merged": merge, "at": _now(), "by": actor})
+    b["versions"] = []
+    b["current"] = 0
+    b["alias_of"] = keep
+    b["merged_into"] = keep
+    b["merged_at"] = _now()
+
+    meta = {"work_id": keep, "version": new_current, "content_sha": chosen["content_sha"],
+            "published_by": actor}
+    for path in (store.work_published_path(a), store.work_published_path(b)):
+        store.copy_object(chosen["object_path"], path, meta)
+    for alias in aliases_of(merge, registry):
+        alias["alias_of"] = keep  # an alias of the merged work now points at the kept one
+        store.copy_object(chosen["object_path"], store.work_published_path(alias), meta)
+
+    for _attempt in range(5):
+        try:
+            store.write_json(store.REGISTRY_PATH, registry, gen)
+            break
+        except store.Conflict:
+            raise RuntimeError("the registry changed during the merge; nothing was written - run it again")
+
+    # Anything waiting to update the merged work now updates the kept one.
+    retargeted = []
+    for _attempt in range(5):
+        staging, sgen = load_staging()
+        retargeted = []
+        for item in staging["items"].values():
+            if item.get("state") != "pending":
+                continue
+            prop = item.get("proposal") or {}
+            if prop.get("work_id") == merge:
+                prop["work_id"] = keep
+                retargeted.append(item["staging_id"])
+            opt = item.get("optimisation") or {}
+            if opt.get("work_id") == merge:
+                opt["work_id"] = keep
+                if item["staging_id"] not in retargeted:
+                    retargeted.append(item["staging_id"])
+        if not retargeted:
+            break
+        try:
+            store.write_json(store.STAGING_PATH, staging, sgen)
+            break
+        except store.Conflict:
+            continue
+    return {"dry_run": False, **plan, "retargeted_staging": retargeted}
+
+
+def resolve_already_published(group: str = "", actor: str = "unknown", dry_run: bool = True) -> dict:
+    """
+    Close waiting items whose exact file is already published (HUB-53).
+
+    The 16 Sound & Motion recordings on LIVE were published, and their queue
+    items still said pending with an "Add this piece" button that would have
+    minted duplicates. An item is resolved only on certainty: the same Drive
+    file id AND the same bytes as a version already in the registry.
+    """
+    registry, _gen = load_registry()
+    published = {}
+    for work in registry["works"].values():
+        for v in work["versions"]:
+            published[(v.get("source_file_id"), v.get("content_sha"))] = (work, v)
+            if v.get("source_sha"):
+                published[(v.get("source_file_id"), v["source_sha"])] = (work, v)
+
+    staging, sgen = load_staging()
+    found = []
+    for item in staging["items"].values():
+        if item.get("state") != "pending" or (group and item.get("group") != group):
+            continue
+        hit = published.get((item.get("source_file_id"), item.get("content_sha")))
+        if hit is None and item.get("source_sha"):
+            hit = published.get((item.get("source_file_id"), item["source_sha"]))
+        if hit is None:
+            continue
+        work, v = hit
+        found.append({"staging_id": item["staging_id"], "source_name": item.get("source_name"),
+                      "work_id": work["work_id"], "canonical": work["canonical"], "version": v["n"]})
+    if dry_run or not found:
+        return {"dry_run": dry_run, "count": len(found), "items": found}
+
+    for row in found:
+        _close_staging(row["staging_id"], "published", actor,
+                       {"work_id": row["work_id"], "version": row["version"],
+                        "resolved": "already published"})
+    return {"dry_run": False, "count": len(found), "items": found}
 
 
 def _structure_change_message(published: dict, incoming: dict) -> str:
@@ -485,6 +832,8 @@ def rollback(work_id: str, to_version: int, actor: str = "unknown") -> dict:
     work = registry["works"].get(work_id)
     if work is None:
         raise KeyError("no work {}".format(work_id))
+    work = effective(work, registry)
+    work_id = work["work_id"]
 
     target = next((v for v in work["versions"] if v["n"] == to_version), None)
     if target is None:
@@ -501,18 +850,17 @@ def rollback(work_id: str, to_version: int, actor: str = "unknown") -> dict:
 
     was = work["current"]
     ppath = store.work_published_path(work)
-    store.copy_object(
-        target["object_path"],
-        ppath,
-        {
-            "work_id": work_id,
-            "version": to_version,
-            "content_sha": target["content_sha"],
-            "page_count": target["structure"]["page_count"],
-            "rolled_back_from": was,
-            "published_by": actor,
-        },
-    )
+    rb_meta = {
+        "work_id": work_id,
+        "version": to_version,
+        "content_sha": target["content_sha"],
+        "page_count": target["structure"]["page_count"],
+        "rolled_back_from": was,
+        "published_by": actor,
+    }
+    store.copy_object(target["object_path"], ppath, rb_meta)
+    for alias in aliases_of(work_id, registry):
+        store.copy_object(target["object_path"], store.work_published_path(alias), rb_meta)
 
     work["current"] = to_version
     work.setdefault("rollbacks", []).append(
@@ -549,9 +897,12 @@ def library(group: str) -> list[dict]:
     registry, _gen = load_registry()
     out = []
     for work in registry["works"].values():
-        if work["group"] != group or not work["versions"]:
+        if work["group"] != group:
             continue
-        current = next(v for v in work["versions"] if v["n"] == work["current"])
+        source = effective(work, registry)
+        if not source["versions"]:
+            continue
+        current = next(v for v in source["versions"] if v["n"] == source["current"])
         out.append(
             {
                 "work_id": work["work_id"],
@@ -576,6 +927,10 @@ def library(group: str) -> list[dict]:
                 # from `project` (where it was first published) after a move.
                 "folder": work.get("folder", work["project"]),
                 "object_path": store.work_published_path(work),
+                # v0.9.0: set when this project's copy shares another work's
+                # music (link_existing or a merge). The Hub treats both ids as
+                # the same piece.
+                "alias_of": work.get("alias_of", ""),
             }
         )
     out.sort(key=lambda w: (w["project"], w["canonical"]))
@@ -606,6 +961,7 @@ def publish_batch(decisions: list[dict], actor: str = "unknown") -> dict:
                 canonical=item.get("canonical"),
                 accept_structure_change=bool(item.get("accept_structure_change")),
                 actor=actor,
+                allow_large=bool(item.get("allow_large")),
             )
             results.append({"staging_id": staging_id, "ok": True, **outcome})
         except (KeyError, ValueError) as exc:

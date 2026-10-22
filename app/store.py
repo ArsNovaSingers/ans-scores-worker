@@ -40,6 +40,10 @@ REGISTRY_PATH = "_registry/works.json"
 STAGING_PATH = "_state/staging.json"
 CURSORS_PATH = "_state/cursors.json"
 
+# Resumable upload chunk (must be a multiple of 256 KiB) and per-request timeout.
+UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+UPLOAD_TIMEOUT_SECONDS = 300
+
 _client = None
 _client_lock = threading.Lock()
 
@@ -107,9 +111,16 @@ def work_published_path(work: dict) -> str:
 def upload_file(local_path: str, object_path: str, metadata: dict | None = None,
                 content_type: str = "application/pdf") -> str:
     blob = bucket().blob(object_path)
+    # v0.9.0 (HUB-52). The Ligeti Lux Aeterna PDF (140.7 MB) failed here on
+    # 2026-10-22 with "The write operation timed out": the library default
+    # sends a large file as one resumable request with a 60 s socket timeout,
+    # and on a slow moment that is not enough - a 144 MB file had stored fine
+    # an hour earlier. Small chunks, each with a generous timeout, make the
+    # size of the file irrelevant to whether it stores.
+    blob.chunk_size = UPLOAD_CHUNK_BYTES
     if metadata:
         blob.metadata = {k: str(v) for k, v in metadata.items()}
-    blob.upload_from_filename(local_path, content_type=content_type)
+    blob.upload_from_filename(local_path, content_type=content_type, timeout=UPLOAD_TIMEOUT_SECONDS)
     blob.reload()
     return blob.md5_hash or ""
 
