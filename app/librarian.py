@@ -392,6 +392,9 @@ def publish(staging_id: str, decision: str, work_id: str | None = None,
             "current": 0,
             "source_missing": False,
         }
+        # v0.9.1: the real Drive folder, when it differs from the publishing name.
+        if item.get("folder") and item["folder"] != item["project"]:
+            work["folder"] = item["folder"]
         registry["works"][work_id] = work
         n = 1
     else:
@@ -514,6 +517,8 @@ def _link_existing(item: dict, staging_id: str, work_id: str | None, canonical: 
         "alias_of": target["work_id"],
         "source_missing": False,
     }
+    if item.get("folder") and item["folder"] != item["project"]:
+        alias["folder"] = item["folder"]
     ppath = store.work_published_path(alias)
     store.copy_object(current["object_path"], ppath, {
         "work_id": target["work_id"], "alias": alias_id, "version": current["n"],

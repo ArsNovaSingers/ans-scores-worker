@@ -316,6 +316,13 @@ check(res["dry_run"] and res["count"] == 1, "resolve dry run finds the stale ite
 code, res = post("/staging/resolve", {"group": "ans", "dry_run": False})
 check(librarian.load_staging()[0]["items"]["stale0000001"]["state"] == "published", "stale item closed as published")
 
+
+# 10. v0.9.1: the real Drive folder travels with PDFs too ("PDFs" is not lost).
+code, res = post("/scan", {"group": "claude-test", "folder_id": "A", "project_prefix": "Claude Test Concert"})
+check("Claude Test Concert/PDFs" in res["folders_in_scan"], "folders_in_scan reports the real PDFs folder")
+lib = {r["canonical"]: r for r in get("/library/claude-test?urls=0")[1]["scores"]}
+check(lib["BigScore"]["project"] == "Claude Test Concert" and lib["BigScore"]["folder"] == "Claude Test Concert/PDFs",
+      "published path unchanged (frozen), folder reports PDFs")
 code, res = get("/health")
-check(res["version"] == "0.9.0", "health reports 0.9.0")
+check(res["version"] == "0.9.1", "health reports 0.9.1")
 print("\nALL %d CHECKS PASSED" % ok)
