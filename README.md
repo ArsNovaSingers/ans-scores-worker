@@ -261,3 +261,12 @@ bucket only.
   uploads now go in 8 MiB chunks with a 300 s timeout.
 - `tests/test_local_v090.py` runs all of this against an in-memory bucket and a
   fake Drive (needs flask, pymupdf, pillow; nothing talks to Google).
+
+## v0.9.1 (HUB-51): the real folder, for every file type
+
+The publishing name still drops storage folders such as `PDFs` (those paths are
+frozen, R2), but each file's real Drive folder now travels separately: on staged
+items and new works as `folder`, in `folders_in_scan`, and in move detection.
+The Hub names its headings after the folder exactly as named, so a `PDFs` folder
+shows "PDFs". Existing works pick up their real folder on the next scan, as a
+move; nothing is republished.

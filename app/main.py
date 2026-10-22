@@ -79,6 +79,22 @@ def _project_from_path(rel_path: list[str], prefix: str = "") -> str:
     return "/".join(parts) if parts else "_root"
 
 
+def _folder_from_path(rel_path: list[str], prefix: str = "") -> str:
+    """
+    The Drive folder a file really sits in, with NOTHING collapsed (v0.9.1).
+
+    _project_from_path() drops storage-sounding folders ("PDFs") because the
+    published path is built from it and those paths are frozen (R2) - so it
+    cannot change. But the Hub names its headings after the real folder
+    (Jonathan, 2026-10-22: "PDFs" shows "PDFs"), so the real folder travels
+    separately: on staged items, on works as `folder`, and in folders_in_scan.
+    """
+    parts = [p for p in rel_path if p.strip()]
+    if prefix:
+        return "/".join([prefix] + parts)
+    return "/".join(parts) if parts else "_root"
+
+
 def _clean_prefix(raw) -> str:
     """A prefix is a folder name in an object path: no slashes at the ends, no dot segments."""
     parts = [p.strip() for p in str(raw or "").replace("\\", "/").split("/")]
@@ -88,7 +104,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.1"})
 
 
 @app.get("/drive/folders")
@@ -510,8 +526,11 @@ def scan():
     audio_all_ids = {f["id"] for f in audio}
     # Every mirror folder this scan can publish into, changed or not. The Hub
     # reads this to show new subfolders without anybody typing their names.
+    # v0.9.1: both the publishing name and the real folder, so an address the
+    # Hub already knows keeps matching and the real one ("…/PDFs") appears.
     folders_in_scan = sorted(
         {_project_from_path(f.get("rel_path", []), prefix) for f in pdfs + audio}
+        | {_folder_from_path(f.get("rel_path", []), prefix) for f in pdfs + audio}
     )
     audio, lossless_skipped = media.prefer_compressed(audio)
     seen_ids = {f["id"] for f in pdfs} | audio_all_ids
@@ -553,7 +572,7 @@ def scan():
         work = by_source.get(f["id"])
         if work is None:
             continue
-        now = _project_from_path(f.get("rel_path", []), prefix)
+        now = _folder_from_path(f.get("rel_path", []), prefix)
         if now != work.get("folder", work["project"]):
             moves[work["work_id"]] = now
     moved = librarian.record_folders(moves) if moves else []
@@ -649,6 +668,7 @@ def scan():
         entry = {
             "group": group,
             "project": project,
+            "folder": _folder_from_path(f.get("rel_path", []), prefix),
             "source_file_id": f["id"],
             "source_name": f["name"],
             "source_size": int(f.get("size") or 0),
@@ -762,6 +782,7 @@ def scan():
         entry = {
             "group": group,
             "project": project,
+            "folder": _folder_from_path(f.get("rel_path", []), prefix),
             "source_file_id": f["id"],
             "source_name": f["name"],
             "source_size": int(f.get("size") or 0),
