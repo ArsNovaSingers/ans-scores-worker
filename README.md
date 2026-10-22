@@ -75,6 +75,8 @@ currently does and this service does not.
 | POST | `/rollback` | put a previous version back on the published path |
 | GET | `/library/<group>` | the singer-facing view: what is published, by project |
 | POST | `/publish-batch` | decide several staged items in one call |
+| POST | `/works/merge` | v0.9.0 - two works that are one piece become one history; the merged one becomes an alias (dry run unless `dry_run:false`; `current` must be stated) |
+| POST | `/staging/resolve` | v0.9.0 - close waiting items whose exact file (Drive id + bytes) is already published (dry run by default) |
 
 ### Scanning
 
@@ -231,3 +233,31 @@ this bucket** - deleting a take is the singer's right - and `store.py` still has
 no delete call. CORS for the bucket lives in `app/takes.py` and is applied with
 `POST /takes/setup`; the service account needs `roles/storage.admin` on that
 bucket only.
+
+
+## v0.9.0 (HUB-52, HUB-53): automatic optimisation, aliases, honest failures
+
+- **Optimisation is AUTOMATIC on intake.** Jonathan, 2026-10-22, reversing the
+  2026-08-25 ruling that it is only ever offered. `/scan` builds a smaller copy
+  of any PDF over 30 MB before staging it, on every path that scans, with the
+  same `optimise.assess()` and the same verification gates (page count, page
+  geometry, the ink band, a clean render). The original stays in Drive; its hash
+  and fingerprint are kept on the item (`source_sha`, `source_edition_key`) and
+  on the published version, so rescanning the unchanged original is a duplicate.
+  Approve still decides what publishes. `/optimise/scan` remains for files
+  published before this, and takes `work_ids` to pick specific ones.
+- **`/publish` refuses** a PDF still over 30 MB unless `allow_large: true`, and
+  refuses to publish a file again that is already published (same Drive id and
+  bytes).
+- **Aliases.** A score already published for another project of the group is
+  proposed as `link_existing`, not a new work. Approving it creates an alias in
+  this project: its own frozen path (R2), no versions of its own, every version
+  of the shared work copied to it. `/works/merge` turns two works that are one
+  piece into the same shape. `/library` marks alias rows with `alias_of`.
+- **Storage failures are visible.** The file is stored before its queue item is
+  written. If storing fails the item is recorded with `state: "error"` and the
+  reason, the scan reports `outcome: "store_failed"`, and the scan carries on.
+  The 2026-10-22 Ligeti failure was a 60 s socket timeout on a one-shot upload;
+  uploads now go in 8 MiB chunks with a 300 s timeout.
+- `tests/test_local_v090.py` runs all of this against an in-memory bucket and a
+  fake Drive (needs flask, pymupdf, pillow; nothing talks to Google).

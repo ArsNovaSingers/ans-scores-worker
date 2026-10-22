@@ -3,9 +3,11 @@ ans-scores-worker - HTTP surface.
 
 claude/portal/Device_Sync_Spec.md. What exists here: the Drive walk, identity,
 staging, publishing under frozen names, versioning, rollback, the group library
-the Hub renders from, read-only WebDAV (Phase 5), and PDF optimisation offered
-for a human's approval (Phase 2, /optimise/scan). What does not exist yet, on
-purpose: quiet hours (Phase 6).
+the Hub renders from, read-only WebDAV (Phase 5), and PDF optimisation (Phase 2).
+Since v0.9.0 a staged PDF over 30 MB is optimised AUTOMATICALLY on intake
+(Jonathan, 2026-10-22, reversing the 2026-08-25 ruling); /optimise/scan still
+offers smaller copies of files published before that. What does not exist yet,
+on purpose: quiet hours (Phase 6).
 
 This service knows nothing about singers or permissions. /library answers
 "what is published for this group"; WordPress owns "who is in that group".
@@ -86,7 +88,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.8.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.0"})
 
 
 @app.get("/drive/folders")
@@ -208,6 +210,11 @@ def optimise_staged():
         entry = stg["items"].get(staging_id)
         if entry is None:
             return jsonify({"ok": False, "error": "the staged item vanished"}), 404
+        # v0.9.0: remember what the ORIGINAL was, so a later scan of the
+        # unchanged Drive file still recognises it after the swap.
+        entry.setdefault("source_sha", entry.get("content_sha"))
+        entry.setdefault("source_edition_key", (entry.get("inspected") or {}).get("edition_key"))
+        entry.setdefault("original_size", entry.get("source_size"))
         entry["content_sha"] = sha
         entry["inspected"] = inspected
         entry["source_size"] = report["bytes_after"]
@@ -249,10 +256,12 @@ def optimise_scan():
     """
     Offer smaller versions of what is already published. Publishes nothing.
 
-    Per Device_Sync_Spec 3.5 and Jonathan's 2026-08-25 ruling, optimisation is
-    never applied automatically. This walks a group's published works, builds a
-    candidate for each, and parks the ones worth looking at in the SAME staging
-    queue that Drive intake uses - so approving one is the ordinary
+    Since v0.9.0 NEW files are optimised automatically on intake (Jonathan,
+    2026-10-22, reversing the 2026-08-25 ruling that optimisation is never
+    automatic - see /scan). This route is for what was published before that:
+    it walks a group's published works, builds a candidate for each, and parks
+    the ones worth looking at in the SAME staging queue that Drive intake
+    uses - so approving one is the ordinary
     `POST /publish {decision: "new_edition"}` and inherits everything that
     already guards a publish: R3 ordering, the section 3.4 page-count gate, the
     version history, and rollback.
@@ -261,7 +270,7 @@ def optimise_scan():
     A second approval mechanism would be a second place for "is this safe to
     publish" to be answered, and the two would drift.
 
-    Body: {group, project?, limit?}
+    Body: {group, project?, limit?, work_ids?}
     """
     if not _authorised():
         return _deny()
@@ -269,6 +278,7 @@ def optimise_scan():
     body = request.get_json(silent=True) or {}
     group = str(body.get("group") or "").strip()
     only_project = str(body.get("project") or "").strip()
+    only_works = {str(w) for w in (body.get("work_ids") or []) if str(w).strip()}
     limit = int(body.get("limit") or 25)
     if not group:
         return jsonify({"ok": False, "error": "group is required"}), 400
@@ -291,6 +301,8 @@ def optimise_scan():
         if work.get("group") != group:
             continue
         if only_project and work.get("project") != only_project:
+            continue
+        if only_works and work_id not in only_works:
             continue
         if not work.get("versions"):
             continue
@@ -451,6 +463,16 @@ def scan():
 
     A PDF that might be an edition of an existing score is ALWAYS left for a
     human. R4 is about that case, and it is untouched.
+
+    v0.9.0 (HUB-52): a PDF over 30 MB is made smaller HERE, before it is
+    staged, on every path that scans - the Hub button, the project screen,
+    REST. Same optimise.assess() and the same verification gates as the
+    Optimize button; the original stays untouched in Drive and its hash and
+    fingerprint are kept on the item, so the unchanged original is recognised
+    on the next scan. Approve still decides what publishes.
+
+    A file that cannot be stored is recorded with state "error" and reported
+    as outcome "store_failed", instead of a 500 that loses the whole scan.
     """
     if not _authorised():
         return _deny()
@@ -503,6 +525,13 @@ def scan():
         for item in staging["items"].values()
         if item.get("state") == "pending"
     }
+    # A file that failed to store last time is tried again; its old error
+    # item is closed as superseded when the new attempt is recorded.
+    failed_before = {
+        item["source_file_id"]: item["staging_id"]
+        for item in staging["items"].values()
+        if item.get("state") == "error"
+    }
 
     results = []
     counters = {"unchanged": 0, "examined": 0, "remaining": 0}
@@ -535,7 +564,7 @@ def scan():
         if work is None:
             return False
         current = next((v for v in work["versions"] if v["n"] == work["current"]), None)
-        return bool(current) and current.get("content_sha") == sha
+        return bool(current) and sha in (current.get("content_sha"), current.get("source_sha"))
 
     def _skip(f) -> bool:
         cached = cursors["files"].get(f["id"])
@@ -562,30 +591,40 @@ def scan():
             "content_sha": sha,
         }
 
-    def _stage(entry, sha, inspected, proposal, local, ext):
-        staging_id = librarian.stage(
-            {
-                **entry,
-                "content_sha": sha,
-                "inspected": inspected,
-                "proposal": proposal,
-                "staging_path": "",  # filled below once we know the id
-            }
-        )
+    def _stage(entry, sha, inspected, proposal, local, ext, extra=None):
+        """
+        Store the file FIRST, then record the item (v0.9.0). If storing fails
+        the item is recorded with state "error" and the reason, and the scan
+        carries on: returns (staging_id, error or "").
+        """
+        staging_id = librarian.new_staging_id()
         spath = store.staging_path(staging_id, ext)
-        store.upload_file(
-            local, spath, {"staging_id": staging_id, "sha256": sha},
-            content_type=media.content_type(ext),
-        )
-        for _attempt in range(5):
-            stg, gen = librarian.load_staging()
-            stg["items"][staging_id]["staging_path"] = spath
+        record = {
+            **entry,
+            **(extra or {}),
+            "content_sha": sha,
+            "inspected": inspected,
+            "proposal": proposal,
+            "staging_path": spath,
+        }
+        error = ""
+        try:
+            store.upload_file(
+                local, spath, {"staging_id": staging_id, "sha256": sha},
+                content_type=media.content_type(ext),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported on the item, never lost
+            error = "could not store the file: {}".format(exc)
+            record["staging_path"] = ""
+            record["error"] = error
+        librarian.stage(record, staging_id=staging_id, state="error" if error else "pending")
+        previous = failed_before.get(entry["source_file_id"])
+        if previous:
             try:
-                store.write_json(store.STAGING_PATH, stg, gen)
-                break
-            except store.Conflict:
-                continue
-        return staging_id
+                librarian._close_staging(previous, "superseded", actor, {"superseded_by": staging_id})
+            except (KeyError, RuntimeError):
+                pass
+        return staging_id, error
 
     def _auto(staging_id, proposal, row):
         try:
@@ -647,16 +686,67 @@ def scan():
                 results.append({**entry, "outcome": "duplicate", "why": proposal["why"]})
                 continue
 
-            staging_id = _stage(entry, sha, inspected, proposal, local, "pdf")
+            # v0.9.0 (HUB-52): automatic optimisation on intake, over 30 MB.
+            source_size = os.path.getsize(local)
+            entry["source_size"] = source_size
+            extra = {"source_sha": sha, "source_edition_key": inspected["edition_key"],
+                     "original_size": source_size}
+            staged_file, staged_sha, staged_inspected = local, sha, inspected
+            if source_size > librarian.BIG_FILE_BYTES:
+                smaller = os.path.join(tmp, "smaller.pdf")
+                try:
+                    report = optimise.assess(local, smaller)
+                except Exception as exc:  # noqa: BLE001 - reported, and the original is staged
+                    report = {"outcome": "optimise_failed: {}".format(exc), "verify": None,
+                              "bytes_before": source_size, "bytes_after": None}
+                usable = bool(
+                    report.get("bytes_after")
+                    and (report.get("verify") or {}).get("ok")
+                    and report["bytes_after"] < source_size
+                )
+                if usable:
+                    try:
+                        staged_inspected = fingerprint.inspect(smaller)
+                        staged_sha = fingerprint.content_sha(smaller)
+                        staged_file = smaller
+                    except ValueError as exc:
+                        usable = False
+                        report["outcome"] = "candidate unreadable: {}".format(exc)
+                extra["optimisation"] = {
+                    "automatic": True,
+                    "applied_before_publishing": usable,
+                    "outcome": report.get("outcome", ""),
+                    "bytes_before": source_size,
+                    "bytes_after": report.get("bytes_after") if usable else None,
+                    "saved_bytes": (source_size - report["bytes_after"]) if usable else 0,
+                    "saved_ratio": report.get("saved_ratio", 0.0) if usable else 0.0,
+                    "target_dpi": optimise.TARGET_DPI,
+                    "jpeg_quality": optimise.JPEG_QUALITY,
+                    "images_reencoded": report.get("images_reencoded", 0),
+                    "verify": report.get("verify"),
+                }
+                if usable:
+                    entry["source_size"] = report["bytes_after"]
+
+            staging_id, store_error = _stage(entry, staged_sha, staged_inspected, proposal,
+                                             staged_file, "pdf", extra)
             row = {
                 **entry,
                 "media": media.PDF,
-                "outcome": "staged",
+                "outcome": "store_failed" if store_error else "staged",
                 "staging_id": staging_id,
                 "pages": inspected["page_count"],
                 "fingerprint": inspected["edition_method"],
                 "proposal": proposal,
             }
+            if store_error:
+                row["detail"] = store_error
+            if "optimisation" in extra:
+                row["optimisation"] = {k: extra["optimisation"][k] for k in
+                                       ("applied_before_publishing", "bytes_before", "bytes_after", "outcome")}
+            if store_error:
+                results.append(row)
+                continue
             if proposal["decision"] == "new_work" and project.strip().lower() in auto_projects:
                 _auto(staging_id, proposal, row)
                 if row["outcome"] == "published":
@@ -703,14 +793,18 @@ def scan():
                 continue
 
             inspected = media.inspected_for_audio(ext, size, sha)
-            staging_id = _stage(entry, sha, inspected, proposal, local, ext)
+            staging_id, store_error = _stage(entry, sha, inspected, proposal, local, ext)
             row = {
                 **entry,
                 "media": media.AUDIO,
-                "outcome": "staged",
+                "outcome": "store_failed" if store_error else "staged",
                 "staging_id": staging_id,
                 "proposal": proposal,
             }
+            if store_error:
+                row["detail"] = store_error
+                results.append(row)
+                continue
             if auto_audio and proposal["decision"] in ("new_work", "new_edition"):
                 _auto(staging_id, proposal, row)
                 if row["outcome"] == "published":
@@ -753,6 +847,7 @@ def scan():
             "examined": counters["examined"],
             "not_examined_this_run": counters["remaining"],
             "published_now": sum(1 for r in results if r.get("outcome") == "published"),
+            "store_failed": sum(1 for r in results if r.get("outcome") == "store_failed"),
             "moved": moved,
             "missing_at_source": flagged,
             "results": results,
@@ -828,12 +923,57 @@ def publish():
             canonical=body.get("canonical"),
             accept_structure_change=bool(body.get("accept_structure_change")),
             actor=body.get("actor", "unknown"),
+            allow_large=bool(body.get("allow_large")),
         )
     except KeyError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 404
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, **result})
+
+
+@app.post("/works/merge")
+def works_merge():
+    """
+    Two works that are one piece become one history (HUB-53). Dry run unless
+    dry_run is false, and `current` must be said: "keep", "merge" or a number.
+
+    Body: {keep, merge, current, dry_run?, actor?}
+    """
+    if not _authorised():
+        return _deny()
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        result = librarian.merge_works(
+            keep=str(body.get("keep") or ""),
+            merge=str(body.get("merge") or ""),
+            current=str(body.get("current") or ""),
+            actor=str(body.get("actor") or "unknown"),
+            dry_run=body.get("dry_run", True) is not False,
+        )
+    except KeyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/staging/resolve")
+def staging_resolve():
+    """
+    Close waiting items whose exact file (same Drive id, same bytes) is
+    already published (HUB-53). Dry run unless dry_run is false.
+
+    Body: {group?, dry_run?, actor?}
+    """
+    if not _authorised():
+        return _deny()
+    body = request.get_json(force=True, silent=True) or {}
+    return jsonify({"ok": True, **librarian.resolve_already_published(
+        group=str(body.get("group") or ""),
+        actor=str(body.get("actor") or "unknown"),
+        dry_run=body.get("dry_run", True) is not False,
+    )})
 
 
 @app.get("/works")
