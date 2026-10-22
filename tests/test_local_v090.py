@@ -272,6 +272,8 @@ check(rows[alias_id]["alias_of"] == keep_id and rows[alias_id]["project"] == "So
 reg, gen = librarian.load_registry()
 dup = json.loads(json.dumps(reg["works"][keep_id]))
 dup.update({"work_id": "dupwork00001", "project": "Sound & Motion Old", "canonical": "Bernstein-SM"})
+for _v in dup["versions"]:
+    _v["source_file_id"] = "f-dup-file"
 reg["works"]["dupwork00001"] = dup
 store.write_json(store.REGISTRY_PATH, reg, gen)
 OBJ[store.work_published_path(dup)] = {"data": b"x", "gen": 1, "meta": {}}
@@ -344,6 +346,30 @@ check(any(m["work_id"] == w2 and m["folder"] == "Concert Two/01 Scores" for m in
 check(res["results"] and res["results"][0]["outcome"] == "duplicate", "unchanged original is a duplicate, not re-staged")
 check(get("/library/g2?urls=0")[1]["scores"][0]["folder"] == "Concert Two/01 Scores", "library reports the new folder")
 
+# 12. v0.9.3: aliases follow a folder rename too. The LIVE case: a work merged
+# BEFORE 0.9.3 has no source_file_id of its own - it must be found through the
+# versions merged in from it. Then a shared (link_existing) copy.
+reg, gen = librarian.load_registry()
+reg["works"]["dupwork00001"].pop("source_file_id", None)  # as merged on LIVE by 0.9.1
+store.write_json(store.REGISTRY_PATH, reg, gen)
+FILES["f-dup-file"] = {"root": "S2", "name": "Bernstein-old.pdf", "rel_path": ["PDFs"], "path": small_copy}
+OBJ.pop(store.CURSORS_PATH, None)
+post("/scan", {"group": "ans", "folder_id": "S2", "project_prefix": "Sound & Motion Old"})
+FILES["f-dup-file"]["rel_path"] = ["01 Scores"]
+OBJ.pop(store.CURSORS_PATH, None)
+code, res = post("/scan", {"group": "ans", "folder_id": "S2", "project_prefix": "Sound & Motion Old"})
+check(any(m["work_id"] == "dupwork00001" and m["folder"] == "Sound & Motion Old/01 Scores" for m in res["moved"]),
+      "a merged alias follows a folder rename (found through merged_from)")
+check(not [r for r in res["results"] if r.get("outcome") == "staged"], "and nothing is re-staged")
+FILES["f-bern-sm"]["rel_path"] = ["01 Scores"]
+OBJ.pop(store.CURSORS_PATH, None)
+code, res = post("/scan", {"group": "ans", "folder_id": "S", "project_prefix": "Sound & Motion"})
+check(any(m["work_id"] == alias_id and m["folder"] == "Sound & Motion/01 Scores" for m in res["moved"]),
+      "a shared (link_existing) alias follows a folder rename")
+rows = {r["work_id"]: r for r in get("/library/ans?urls=0")[1]["scores"]}
+check(rows[alias_id]["folder"] == "Sound & Motion/01 Scores" and rows["dupwork00001"]["folder"] == "Sound & Motion Old/01 Scores",
+      "library reports both aliases in their new folders")
+
 code, res = get("/health")
-check(res["version"] == "0.9.2", "health reports 0.9.2")
+check(res["version"] == "0.9.3", "health reports 0.9.3")
 print("\nALL %d CHECKS PASSED" % ok)

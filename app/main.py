@@ -104,7 +104,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.2"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.3"})
 
 
 @app.get("/drive/folders")
@@ -574,6 +574,25 @@ def scan():
             if sid and not sid.startswith("optimise:"):
                 by_source.setdefault(sid, work)
                 break
+    # v0.9.3: an ALIAS (a shared or merged copy in another project) has no
+    # versions of its own, so the loop above never saw it, and renaming the
+    # folder it sits in left it behind (Bernstein, LIVE 2026-10-22). Trace it
+    # by the Drive file it came from: recorded on the alias since 0.9.3, or -
+    # for a merge done before that - the versions merged in from it.
+    for work in registry["works"].values():
+        if work["group"] != group or not work.get("alias_of"):
+            continue
+        sid = work.get("source_file_id") or ""
+        if not sid:
+            target = registry["works"].get(work["alias_of"]) or {}
+            for v in sorted(target.get("versions", []), key=lambda x: x["n"], reverse=True):
+                merged = v.get("merged_from") or {}
+                vid = v.get("source_file_id") or ""
+                if merged.get("work_id") == work["work_id"] and vid and not vid.startswith("optimise:"):
+                    sid = vid
+                    break
+        if sid:
+            by_source[sid] = work  # the alias's own file: it sits in the alias's folder
     moves = {}
     for f in pdfs + audio:
         work = by_source.get(f["id"])
@@ -590,10 +609,11 @@ def scan():
         if work is None:
             return False
         # Any version taken from this very file with these bytes - including
-        # the original an optimised edition now stands in for (v0.9.2).
+        # the original an optimised edition now stands in for (v0.9.2). An
+        # alias's versions live on the work it shares (v0.9.3).
         return any(
             v.get("source_file_id") == f["id"] and sha in (v.get("content_sha"), v.get("source_sha"))
-            for v in work["versions"]
+            for v in librarian.effective(work, registry)["versions"]
         )
 
     def _skip(f) -> bool:
