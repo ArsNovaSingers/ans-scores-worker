@@ -104,7 +104,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.9.3"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.10.0"})
 
 
 @app.get("/drive/folders")
@@ -1142,15 +1142,59 @@ def library(group: str):
     if not _authorised():
         return _deny()
     include_urls = request.args.get("urls", "1") != "0"
+    # v0.10.0 (WEB-68): `?download=<work_id>` adds a `download_url` to that one
+    # item, signed `attachment` with the published filename. One item, not all:
+    # every signature is an IAM SignBlob round trip, and only the Hub's
+    # Download click needs it.
+    download_for = request.args.get("download", "")
     items = librarian.library(group)
     if include_urls:
         for item in items:
             try:
-                item["url"] = store.signed_url(item["object_path"])
+                item["url"] = store.signed_url(item["object_path"], **_url_terms(item))
             except RuntimeError as exc:
                 item["url"] = None
                 item["url_error"] = str(exc)
+                continue
+            item["url_expires_minutes"] = _url_terms(item)["minutes"]
+            if download_for and item["work_id"] == download_for:
+                try:
+                    item["download_url"] = store.signed_url(
+                        item["object_path"],
+                        minutes=DOWNLOAD_URL_MINUTES,
+                        response_type=item["mime"],
+                        response_disposition=attachment_disposition(item["object_path"]),
+                    )
+                except RuntimeError as exc:
+                    item["download_url"] = None
+                    item["url_error"] = str(exc)
     return jsonify({"ok": True, "group": group, "count": len(items), "scores": items})
+
+
+# v0.10.0 (WEB-68). The Hub now 302s a singer's <audio> element straight to
+# this URL instead of streaming the file through Kinsta. Fifteen minutes is
+# fine for a PDF, which is fetched once; a recording is fetched again on every
+# seek, so a singer who pauses past fifteen minutes and then scrubs would get a
+# 403 from GCS mid-rehearsal. Two hours covers a rehearsal.
+AUDIO_URL_MINUTES = 120
+PDF_URL_MINUTES = 15
+DOWNLOAD_URL_MINUTES = 15
+
+
+def _url_terms(item: dict) -> dict:
+    """How long, and served as what, the singer-facing link for one item is."""
+    if item.get("media") == media.AUDIO:
+        return {"minutes": AUDIO_URL_MINUTES, "response_type": item.get("mime") or None}
+    return {"minutes": PDF_URL_MINUTES}
+
+
+def attachment_disposition(object_path: str) -> str:
+    """`attachment` with the published filename, safe for any title."""
+    from urllib.parse import quote
+
+    name = object_path.rsplit("/", 1)[-1] or "download"
+    ascii_name = name.encode("ascii", "replace").decode("ascii").replace('"', "'").replace("?", "_")
+    return "attachment; filename=\"{}\"; filename*=UTF-8''{}".format(ascii_name, quote(name, safe=""))
 
 
 @app.post("/publish-batch")

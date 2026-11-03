@@ -171,7 +171,8 @@ def write_manifest(group: str, entries: list[dict]) -> None:
     )
 
 
-def signed_url(object_path: str, minutes: int = 15) -> str:
+def signed_url(object_path: str, minutes: int = 15, response_type: str | None = None,
+               response_disposition: str | None = None) -> str:
     """
     Short-lived read URL. The bucket has public access prevention on, so this is
     the only way a byte leaves it - access is always a decision the Hub made,
@@ -201,6 +202,14 @@ def signed_url(object_path: str, minutes: int = 15) -> str:
         }
 
     try:
+        # v0.10.0 (WEB-68): response_type / response_disposition are signed
+        # into the URL, so GCS answers with them whatever the object's own
+        # metadata says. The Hub's <audio> element needs audio/*, and a
+        # Download button needs `attachment` or a PDF opens in the tab.
+        if response_type:
+            signer_kwargs["response_type"] = response_type
+        if response_disposition:
+            signer_kwargs["response_disposition"] = response_disposition
         return blob.generate_signed_url(
             version="v4",
             expiration=timedelta(minutes=minutes),

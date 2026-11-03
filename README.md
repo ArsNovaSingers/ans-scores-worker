@@ -286,3 +286,19 @@ to its Drive file and a folder rename left it behind (Bernstein in Sound & Motio
 2026-10-22). An alias now records its own Drive file (link_existing, merge); for a merge made
 before 0.9.3 it is found through the versions merged in from it. Rehearsed against a copy of
 LIVE's registry: 0.9.2 moved 5 of 6 Sound & Motion scores (the LIVE result), 0.9.3 moves 6 of 6.
+
+## v0.10.0: recordings are served straight from the bucket (WEB-68)
+
+The Hub used to pull every recording onto Kinsta and stream it back out, and Kinsta's edge
+strips Range, so every play and every seek re-downloaded the whole file through the origin (1.83 GB
+in three days, 2026-11-01). The Hub now permission-checks and 302s the `<audio>` element to the
+signed URL from `/library`. Two things changed here to make that work:
+
+- **Audio links last 120 minutes, not 15**, and are signed with `response-content-type` = the
+  item's `mime`. A recording is re-fetched on every seek; fifteen minutes broke a singer who
+  paused and then scrubbed. PDFs keep 15 minutes. Each item reports `url_expires_minutes`.
+- **`/library/<group>?download=<work_id>`** adds a `download_url` to that one item, signed
+  `attachment` with the published filename, for the Hub's Download button. One item only:
+  every signature is an IAM SignBlob round trip.
+
+Both are additive. A Hub that does not ask for them sees the same response shape as 0.9.3.
