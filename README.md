@@ -287,6 +287,13 @@ to its Drive file and a folder rename left it behind (Bernstein in Sound & Motio
 before 0.9.3 it is found through the versions merged in from it. Rehearsed against a copy of
 LIVE's registry: 0.9.2 moved 5 of 6 Sound & Motion scores (the LIVE result), 0.9.3 moves 6 of 6.
 
+## v0.10.1: sign one work, not the whole group (WEB-68)
+
+`GET /library/<group>?work=<work_id>` returns only that work, so only that work is signed.
+Measured on staging 2026-11-02: an uncached `/library/ans` signs 67 items and takes about 5 s,
+and the Hub's Play click asked several times, so the 302 took 12-19 s. The Hub (1.59.2+) sends
+`work` on every click. Without it the response is unchanged, so an older Hub still works.
+
 ## v0.10.0: recordings are served straight from the bucket (WEB-68)
 
 The Hub used to pull every recording onto Kinsta and stream it back out, and Kinsta's edge
