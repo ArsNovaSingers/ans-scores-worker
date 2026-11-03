@@ -1,6 +1,7 @@
 """
-WEB-68 (v0.10.0): audio links last two hours and are served as audio/*;
-`?download=<work_id>` adds an attachment-signed link for that one item.
+WEB-68 (v0.10.0/0.10.1): audio links last two hours and are served as audio/*;
+`?download=<work_id>` adds an attachment-signed link for that one item;
+`?work=<work_id>` signs only that item (0.10.1).
 Nothing here talks to Google: store.signed_url is replaced with a recorder.
 """
 import os
@@ -45,6 +46,14 @@ assert minutes == 15 and rtype == "audio/mpeg", CALLS[-1]
 assert disp.startswith('attachment; filename="1-Pr_logo e Balada.mp3"'), disp
 assert "filename*=UTF-8''1-Pr%C3%B3logo%20e%20Balada.mp3" in disp, disp
 
+CALLS.clear()
+r = client.get("/library/g?work=w_mp3&download=w_mp3", headers=H).get_json()
+assert [s["work_id"] for s in r["scores"]] == ["w_mp3"] and r["count"] == 1, r
+assert len(CALLS) == 2, CALLS  # one inline link + one attachment link, nothing else signed
+CALLS.clear()
+r = client.get("/library/g?work=nope", headers=H).get_json()
+assert r["scores"] == [] and CALLS == [], (r, CALLS)
+
 assert client.get("/library/g").status_code in (401, 403)
-assert client.get("/health").get_json()["version"] == "0.10.0"
+assert client.get("/health").get_json()["version"] == "0.10.1"
 print("ok - WEB-68 worker url terms")

@@ -104,7 +104,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.10.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.10.1"})
 
 
 @app.get("/drive/folders")
@@ -1147,7 +1147,13 @@ def library(group: str):
     # every signature is an IAM SignBlob round trip, and only the Hub's
     # Download click needs it.
     download_for = request.args.get("download", "")
+    # v0.10.1 (WEB-68): `?work=<work_id>` answers for that one item only. A
+    # Play or Download click needs one fresh link, and signing the whole group
+    # (67 items on `ans`, ~5 s of SignBlob calls) made every click wait for it.
+    only = request.args.get("work", "")
     items = librarian.library(group)
+    if only:
+        items = [item for item in items if item.get("work_id") == only]
     if include_urls:
         for item in items:
             try:
