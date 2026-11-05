@@ -181,3 +181,13 @@ def download(file_id: str, dest_path: str, svc=None) -> None:
         done = False
         while not done:
             _status, done = downloader.next_chunk()
+
+
+def export_csv(file_id: str, svc=None) -> str:
+    """
+    A native Google Sheet's FIRST TAB as CSV text. Read-only: files.export needs
+    no Sheets API scope, and Drive only ever exports the first tab to CSV.
+    """
+    svc = svc or service()
+    raw = svc.files().export(fileId=file_id, mimeType="text/csv").execute()
+    return raw.decode("utf-8-sig", "replace") if isinstance(raw, bytes) else str(raw)

@@ -25,7 +25,7 @@ import time
 
 from flask import Flask, jsonify, request
 
-from . import dav, drive, fingerprint, librarian, media, naming, optimise, store, takes
+from . import dav, drive, fingerprint, librarian, media, naming, optimise, sheets, store, takes
 
 app = Flask(__name__)
 
@@ -104,7 +104,7 @@ def _clean_prefix(raw) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.10.1"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.11.0"})
 
 
 @app.get("/drive/folders")
@@ -489,6 +489,11 @@ def scan():
 
     A file that cannot be stored is recorded with state "error" and reported
     as outcome "store_failed", instead of a 500 that loses the whole scan.
+
+    v0.11.0 (HUB-68): with `include_sheets` true the answer also carries
+    `sheets`, the cells of every native Google Sheet in the tree. Opt-in, so a
+    caller that does not ask pays nothing and sees the old answer, with sheets
+    still listed under `ignored`.
     """
     if not _authorised():
         return _deny()
@@ -504,6 +509,7 @@ def scan():
     }
     actor = str(body.get("actor") or "scan")
     prefix = _clean_prefix(body.get("project_prefix"))
+    include_sheets = bool(body.get("include_sheets"))
     if not group or not folder_id:
         return jsonify({"ok": False, "error": "group and folder_id are required"}), 400
 
@@ -513,6 +519,11 @@ def scan():
         files = drive.walk(folder_id, svc)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": "drive walk failed", "detail": str(exc)}), 502
+
+    extra = {}
+    if include_sheets:
+        extra["sheets"] = sheets.read(files, svc)
+        files = [f for f in files if not sheets.is_sheet(f)]
 
     pdfs, audio, ignored = [], [], []
     for f in files:
@@ -904,6 +915,7 @@ def scan():
             "missing_at_source": flagged,
             "results": results,
             "seconds": round(time.time() - started, 1),
+            **extra,
         }
     )
 
