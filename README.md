@@ -64,7 +64,7 @@ currently does and this service does not.
 | POST | `/takes/delete` | v0.8.0 - delete one take (the singer asked) |
 | GET | `/health` | liveness, no auth |
 | GET | `/whoami` | which identity Drive is being read as, and which bucket |
-| POST | `/scan` | walk a group's folder, stage anything new or changed |
+| POST | `/scan` | walk a group's folder, stage anything new or changed. v0.11.0: `include_sheets` also returns the cells of every native Google Sheet in the tree under `sheets` (first tab, as CSV via Drive `files.export`) |
 | GET | `/staging` | what is waiting for a human |
 | POST | `/publish` | turn a staged item into a published version |
 | GET | `/works` | the registry |
