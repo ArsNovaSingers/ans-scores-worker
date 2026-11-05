@@ -197,6 +197,26 @@ growing here to disagree with the first one.
 | `ANS_SCORES_TOKEN` | bearer token. **No default — with it unset every authorised route returns 401**, which is the correct failure |
 | `DRIVE_SUBJECT` | optional. An `@arsnovasingers.org` address to act as via domain-wide delegation. Unset means the service account's own identity, which then has to be a member of the shared drive |
 
+## Two services: deploy to Staging first
+
+Since 2026-10-22 (HUB-56) this repo runs as two Cloud Run services:
+
+| | LIVE | Staging |
+|---|---|---|
+| Service | `ans-scores-worker` | `ans-scores-worker-staging` |
+| `SCORES_BUCKET` | `ars-nova-scores` | `ars-nova-scores-staging` |
+| `TAKES_BUCKET` | default (`ars-nova-practice-takes`) | `ars-nova-practice-takes-staging` |
+| Service account | `ars-nova-mcp-delegate@` | `ans-scores-staging@` |
+
+1. Merge the change and tag `vX.Y.Z`.
+2. Refresh Staging's bucket from LIVE, then deploy the tag to `ans-scores-worker-staging` and test it.
+3. After Jonathan says "promote to live", deploy the same tag to `ans-scores-worker`.
+
+Pass no env vars on a redeploy, so the existing config is kept. The defaults in this code name
+LIVE's buckets, which is why the Staging service account has no role on them: if a Staging env var
+is lost, it fails instead of writing LIVE. Rules and traps: `claude/portal/HANDOFF.md` §14 in
+ArsNovaSingers/ars-nova-wiki.
+
 ## Known limits, stated rather than discovered later
 
 - **Files are downloaded to the instance's temp space**, which on Cloud Run is
