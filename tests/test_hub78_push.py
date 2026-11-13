@@ -4,6 +4,7 @@ in-memory bucket and a fake Drive. Nothing here talks to Google.
 
     python tests/test_hub78_push.py
 """
+import json
 import os
 import shutil
 import sys
@@ -228,43 +229,81 @@ check(row is not None and row["outcome"] in ("staged", "duplicate"), "a second f
 if row and row["outcome"] == "staged":
     check(row["proposal"]["decision"] in ("new_edition", "ask_edition"), "it is proposed as an edition: " + row["proposal"]["decision"])
 
-# ---------------------------------------------------------------- watch
-code, res = post("/drive/watch", {"drive_id": "D", "address": "http://insecure", "token": "s"})
-check(code == 400, "an http address is refused")
+# ---------------------------------------------------------------- watch (0.12.1)
+from app import watch  # noqa: E402
 
-code, res = post("/drive/watch", {"drive_id": "D", "address": "https://site/wp-json/x", "token": "secret"})
+SENT = []
+watch._notify = lambda url, token, payload: SENT.append((url, token, payload)) or ""
+
+W = {"drive_id": "D", "notify_url": "https://site/wp-json/n", "notify_token": "nt", "folders": ["fld-dl"]}
+code, res = post("/drive/watch", dict(W, notify_url="http://insecure"))
+check(code == 400, "an http notify_url is refused")
+
+code, res = post("/drive/watch", W)
 check(code == 200 and res["renewed"] is True, "first watch opens a channel")
-check(CALLS["watch"][-1]["page_token"] == "tok-1" and CALLS["watch"][-1]["token"] == "secret", "it starts from a fresh page token and carries the token")
-first_id = res["channel"]["id"]
-check(res["channel"]["expires_in_hours"] > 160, "it lasts about 7 days")
-check("token" not in str(res["channel"]), "the token is never echoed back")
+call = CALLS["watch"][-1]
+check(call["address"].endswith("/drive/push") and call["address"].startswith("https://"), "Drive is pointed at this worker's /drive/push over https")
+check(call["page_token"] == "tok-1" and call["token"] and call["token"] != "nt", "the channel token is the worker's own, not WordPress's")
+check(res["channel"]["expires_in_hours"] > 160 and res["folders"] == 1, "about 7 days, one watched folder")
+check(call["token"] not in json.dumps(res) and "\"nt\"" not in json.dumps(res), "no token is ever echoed back")
+channel_id, channel_token = call["id"], call["token"]
 
-code, res = post("/drive/watch", {"drive_id": "D", "address": "https://site/wp-json/x", "token": "secret"})
-check(res["renewed"] is False and len(CALLS["watch"]) == 1, "a second call within the window does nothing")
+code, res = post("/drive/watch", dict(W, folders=["fld-dl", "fld-other"]))
+check(res["renewed"] is False and len(CALLS["watch"]) == 1 and res["folders"] == 2, "a second call keeps the channel but updates the folders")
 
-code, res = post("/drive/watch", {"drive_id": "D", "address": "https://site/wp-json/x", "token": "secret", "renew_within_hours": 200})
-check(res["renewed"] is True and CALLS["stop"] == [first_id], "inside the renewal window: a new channel, then the old one stopped")
+code, res = post("/drive/watch", dict(W, renew_within_hours=200))
+check(res["renewed"] is True and CALLS["stop"] == [channel_id], "inside the renewal window: a new channel, then the old one stopped")
+channel_id, channel_token = CALLS["watch"][-1]["id"], CALLS["watch"][-1]["token"]
 
-code, res = post("/drive/watch", {"drive_id": "D", "address": "https://other/wp-json/x", "token": "secret"})
-check(res["renewed"] is True, "a new address always opens a new channel")
 
-# ---------------------------------------------------------------- changes
+def ping(cid, tok, state="change"):
+    r = client.post("/drive/push", headers={"X-Goog-Channel-ID": cid, "X-Goog-Channel-Token": tok,
+                                            "X-Goog-Resource-State": state})
+    return r.status_code, r.get_json()
+
+
+check(ping(channel_id, "wrong")[0] == 403, "a ping with the wrong token is refused")
+check(ping("other", channel_token)[0] == 403, "a ping for an unknown channel is refused")
+code, res = ping(channel_id, channel_token, "sync")
+check(code == 200 and res.get("sync") and not SENT, "the sync handshake tells nobody")
+
+# A Google Doc being typed in, inside the watched folder: never notifies.
+CHANGES.extend([{"fileId": "doc1", "file": {"id": "doc1", "name": "Notes", "mimeType": "application/vnd.google-apps.document", "parents": ["fld-scores"]}}] * 5)
+code, res = ping(channel_id, channel_token)
+check(code == 200 and res["changes"] == 5 and not SENT, "Doc edits do not reach WordPress")
+
+# A PDF outside every watched folder: nothing.
+PARENTS["fld-elsewhere"] = ["drive-root"]
+CHANGES.append({"fileId": "x1", "file": {"id": "x1", "name": "Other.pdf", "mimeType": "application/pdf", "parents": ["fld-elsewhere"]}})
+ping(channel_id, channel_token)
+check(not SENT, "a PDF in an unwatched folder does not reach WordPress")
+
+# The real case: a PDF and an MP3 in a project's subfolders.
 CHANGES.extend([
-    {"fileId": "n1", "removed": False, "file": {"id": "n1", "name": "Some-Children.pdf", "mimeType": "application/pdf", "parents": ["fld-scores"]}},
-    {"fileId": "n2", "removed": True},
+    {"fileId": "n1", "file": {"id": "n1", "name": "Some-Children.pdf", "mimeType": "application/pdf", "parents": ["fld-scores"]}},
+    {"fileId": "n2", "file": {"id": "n2", "name": "Home-BASS.mp3", "mimeType": "audio/mpeg", "parents": ["fld-mp3"]}},
+    {"fileId": "n3", "removed": True},
 ])
-code, res = post("/drive/changes", {"drive_id": "D"})
-check(code == 200 and res["count"] == 2, "changes come back")
-check(res["changes"][0]["ancestors"] == ["fld-scores", "fld-dl", "drive-root"], "with every folder above the file")
-check(res["changes"][1]["removed"] and res["changes"][1]["ancestors"] == [], "a removal has no ancestors")
-check(CALLS["list_tokens"] == ["tok-1"], "the first call reads from the stored token")
-code, res = post("/drive/changes", {"drive_id": "D"})
-check(res["count"] == 0 and CALLS["list_tokens"][-1] == "tok-2", "the token advanced, so nothing is returned twice")
+code, res = ping(channel_id, channel_token)
+check(len(SENT) == 1, "one notification for the burst")
+url, tok, payload = SENT[-1]
+check(url == "https://site/wp-json/n" and tok == "nt", "sent to WordPress with WordPress's token")
+check(payload["folders"] == ["fld-dl"] and set(payload["files"]) == {"Some-Children.pdf", "Home-BASS.mp3"}, "naming the project folder and the files")
 
-code, res = post("/drive/changes", {"drive_id": "NEW"})
-check(res["changes"] == [] and "no page token" in res["note"], "an unknown drive starts counting from now")
+# A Sheet edit notifies once, then is quiet for 5 minutes.
+SENT.clear()
+sheet = {"fileId": "s1", "file": {"id": "s1", "name": "Videos", "mimeType": "application/vnd.google-apps.spreadsheet", "parents": ["fld-dl"]}}
+CHANGES.append(sheet)
+ping(channel_id, channel_token)
+CHANGES.append(sheet)
+ping(channel_id, channel_token)
+check(len(SENT) == 1, "a Sheet being edited notifies once per quiet period")
 
-r = client.post("/drive/changes", json={"drive_id": "D"})
-check(r.status_code == 401, "no token, no changes")
+code, res = get_state = client.get("/drive/watch?drive_id=D", headers=H).status_code, client.get("/drive/watch?drive_id=D", headers=H).get_json()
+check(res["pushes"] >= 5 and res["last_notify"]["folders"] == ["fld-dl"], "pushes and the last notification are recorded")
+
+code, res = post("/drive/unwatch", {"drive_id": "D"})
+check(res["stopped"] == channel_id, "unwatch stops the channel")
+check(ping(channel_id, channel_token)[0] == 403, "and its pings are refused afterwards")
 
 print("\nOK test_hub78_push ({} checks)".format(ok))

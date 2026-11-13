@@ -371,5 +371,5 @@ check(rows[alias_id]["folder"] == "Sound & Motion/01 Scores" and rows["dupwork00
       "library reports both aliases in their new folders")
 
 code, res = get("/health")
-check(res["version"] == "0.12.0", "health reports 0.12.0")
+check(res["version"] == "0.12.1", "health reports 0.12.1")
 print("\nALL %d CHECKS PASSED" % ok)

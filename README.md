@@ -76,9 +76,10 @@ currently does and this service does not.
 | GET | `/library/<group>` | the singer-facing view: what is published, by project |
 | POST | `/publish-batch` | decide several staged items in one call |
 | POST | `/works/merge` | v0.9.0 - two works that are one piece become one history; the merged one becomes an alias (dry run unless `dry_run:false`; `current` must be stated) |
-| GET/POST | `/drive/watch` | v0.12.0 - open or renew a Drive changes channel addressed to the caller (`drive_id`, `address`, `token`); GET shows it |
+| GET/POST | `/drive/watch` | v0.12.1 - open or renew a Drive changes channel pointed at this worker (`drive_id`, `notify_url`, `notify_token`, `folders`); GET shows it |
+| POST | `/drive/push` | v0.12.1 - Drive's ping (no bearer; channel id + channel token). Notifies `notify_url` only about watched folders |
 | POST | `/drive/unwatch` | v0.12.0 - stop the channel |
-| POST | `/drive/changes` | v0.12.0 - every file changed since the last call, each with all its ancestor folders; advances the page token |
+| POST | `/drive/changes` | v0.12.0 - diagnosis only: every file changed since the last read, with its ancestor folders; advances the page token |
 | POST | `/staging/resolve` | v0.9.0 - close waiting items whose exact file (Drive id + bytes) is already published (dry run by default) |
 
 ### Scanning
@@ -355,3 +356,15 @@ pressed Rescan. Two changes:
   does a PDF still over 30 MB after automatic optimisation.
 
 `tests/test_hub78_push.py` covers both against a fake Drive.
+
+
+## v0.12.1 (HUB-78): Drive pings come here, not to WordPress
+
+0.12.0 had Drive ping WordPress directly. On Staging that was 78 pings in seven minutes: Drive
+pings for every change anywhere in the shared drive, and a Google Doc being typed in changes every
+few seconds. Each ping was a full WordPress request, and Staging, which shares a host with LIVE,
+slowed to 25-40 s a page until the channel was stopped. Now Drive pings `POST /drive/push` here.
+The worker reads the change feed and keeps only PDFs, audio and folders whose ancestors include a
+project folder WordPress listed in `folders`. It calls WordPress (`notify_url`, header
+`X-ANS-Notify-Token`) only when one of those changed. A native Sheet notifies a folder at most once
+every 5 minutes. Google Docs never notify.
