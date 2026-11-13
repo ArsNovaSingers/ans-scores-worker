@@ -121,7 +121,7 @@ def _is_score_folder(folder: str) -> bool:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.12.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.12.1"})
 
 
 @app.get("/drive/folders")
