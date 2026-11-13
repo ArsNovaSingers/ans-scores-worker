@@ -55,5 +55,5 @@ r = client.get("/library/g?work=nope", headers=H).get_json()
 assert r["scores"] == [] and CALLS == [], (r, CALLS)
 
 assert client.get("/library/g").status_code in (401, 403)
-assert client.get("/health").get_json()["version"] == "0.11.0"
+assert client.get("/health").get_json()["version"] == "0.12.0"
 print("ok - WEB-68 worker url terms")

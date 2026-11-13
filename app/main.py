@@ -20,12 +20,13 @@ into the Cloud Run request log in plaintext for every call. Not repeating it.
 """
 
 import os
+import re
 import tempfile
 import time
 
 from flask import Flask, jsonify, request
 
-from . import dav, drive, fingerprint, librarian, media, naming, optimise, sheets, store, takes
+from . import dav, drive, fingerprint, librarian, media, naming, optimise, sheets, store, takes, watch
 
 app = Flask(__name__)
 
@@ -57,6 +58,9 @@ def _deny():
 
 # Practice takes (v0.8.0): signed upload/read URLs for a separate private bucket.
 takes.register(app, _authorised, _deny)
+
+# Drive push (v0.12.0, HUB-78): open/renew a changes channel, read the change feed.
+watch.register(app, _authorised, _deny)
 
 
 def _project_from_path(rel_path: list[str], prefix: str = "") -> str:
@@ -102,9 +106,22 @@ def _clean_prefix(raw) -> str:
     return "/".join(parts)
 
 
+# v0.12.0 (HUB-78): folders that hold a project's own scores. A NEW PDF here
+# publishes on its own when the caller asks (auto_publish.new_work_score_folders):
+# Tom putting it there is the decision. A leading order number ("01 Scores") is
+# ignored, as the Hub ignores it.
+SCORE_FOLDER_NAMES = {"score", "scores", "pdf", "pdfs", "sheet music", "sheet-music", "music"}
+
+
+def _is_score_folder(folder: str) -> bool:
+    last = (folder or "").rstrip("/").split("/")[-1].strip().lower()
+    last = re.sub(r"^\d{1,2}[\s._-]*", "", last).strip()
+    return last in SCORE_FOLDER_NAMES
+
+
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.11.0"})
+    return jsonify({"ok": True, "service": "ans-scores-worker", "version": "0.12.0"})
 
 
 @app.get("/drive/folders")
@@ -470,6 +487,11 @@ def scan():
                                         new, or the same Drive file with new
                                         bytes. There is no annotation layer on
                                         audio for a wrong call to damage.
+        auto_publish.new_work_score_folders  (v0.12.0, HUB-78) a PDF that
+                                        matches NOTHING already published and
+                                        sits in a score folder ("Scores",
+                                        "01 Scores", "PDFs", "Sheet Music").
+                                        Tom putting it there is the decision.
         auto_publish.new_work_projects  a PDF in one of these project folders
                                         that matches NOTHING already published.
                                         Meant for rehearsal notes: a new dated
@@ -507,6 +529,7 @@ def scan():
     auto_projects = {
         str(p).strip().lower() for p in (auto.get("new_work_projects") or []) if str(p).strip()
     }
+    auto_score_folders = bool(auto.get("new_work_score_folders"))
     actor = str(body.get("actor") or "scan")
     prefix = _clean_prefix(body.get("project_prefix"))
     include_sheets = bool(body.get("include_sheets"))
@@ -809,7 +832,10 @@ def scan():
             if store_error:
                 results.append(row)
                 continue
-            if proposal["decision"] == "new_work" and project.strip().lower() in auto_projects:
+            if proposal["decision"] == "new_work" and (
+                project.strip().lower() in auto_projects
+                or (auto_score_folders and _is_score_folder(entry["folder"]))
+            ):
                 _auto(staging_id, proposal, row)
                 if row["outcome"] == "published":
                     _remember(f, sha)

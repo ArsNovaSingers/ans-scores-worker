@@ -76,6 +76,9 @@ currently does and this service does not.
 | GET | `/library/<group>` | the singer-facing view: what is published, by project |
 | POST | `/publish-batch` | decide several staged items in one call |
 | POST | `/works/merge` | v0.9.0 - two works that are one piece become one history; the merged one becomes an alias (dry run unless `dry_run:false`; `current` must be stated) |
+| GET/POST | `/drive/watch` | v0.12.0 - open or renew a Drive changes channel addressed to the caller (`drive_id`, `address`, `token`); GET shows it |
+| POST | `/drive/unwatch` | v0.12.0 - stop the channel |
+| POST | `/drive/changes` | v0.12.0 - every file changed since the last call, each with all its ancestor folders; advances the page token |
 | POST | `/staging/resolve` | v0.9.0 - close waiting items whose exact file (Drive id + bytes) is already published (dry run by default) |
 
 ### Scanning
@@ -329,3 +332,26 @@ signed URL from `/library`. Two things changed here to make that work:
   every signature is an IAM SignBlob round trip.
 
 Both are additive. A Hub that does not ask for them sees the same response shape as 0.9.3.
+
+
+## v0.12.0 (HUB-78): Drive push, and new scores in a score folder publish themselves
+
+On 2026-11-12 Tom told the choir three new scores were on the Hub; they sat in Drive until someone
+pressed Rescan. Two changes:
+
+- **Drive push.** WordPress asks this service to open a Drive `changes.watch` channel on the Singers
+  Hub shared drive, addressed to WordPress (`POST /drive/watch {drive_id, address, token}`). Drive
+  pings that address; WordPress then calls `POST /drive/changes`, which returns every changed file
+  with every folder above it, so WordPress can match a file to the project whose Drive folder holds
+  it and scan just that project. The channel id and page token live in `_state/drive_watch.json` in
+  this service's own bucket, so Staging and LIVE never share one. Drive caps a channel at 7 days;
+  `/drive/watch` is idempotent and only reopens inside `renew_within_hours` (default 72) of expiry,
+  for a new address, or with `force`. The new channel is opened before the old one is stopped.
+  The worker never receives the pings itself, and needs no new configuration.
+- **`auto_publish.new_work_score_folders`.** A PDF that matches nothing already published, sitting in
+  a score folder (`Scores`, `01 Scores`, `PDFs`, `Sheet Music`, a leading order number ignored),
+  publishes in the same scan. Anything that could be an edition of a published score
+  (`new_edition`, `ask_edition`, `ambiguous`, `link_existing`) still waits for a person (R4), and so
+  does a PDF still over 30 MB after automatic optimisation.
+
+`tests/test_hub78_push.py` covers both against a fake Drive.
