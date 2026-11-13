@@ -191,3 +191,116 @@ def export_csv(file_id: str, svc=None) -> str:
     svc = svc or service()
     raw = svc.files().export(fileId=file_id, mimeType="text/csv").execute()
     return raw.decode("utf-8-sig", "replace") if isinstance(raw, bytes) else str(raw)
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 (HUB-78): Drive push. Read-only like everything above: changes.watch,
+# changes.list and channels.stop all accept the drive.readonly scope.
+# ---------------------------------------------------------------------------
+
+CHANGE_FIELDS = (
+    "nextPageToken, newStartPageToken, "
+    "changes(fileId, removed, time, file(id, name, mimeType, parents, trashed))"
+)
+
+
+def start_page_token(drive_id: str, svc=None) -> str:
+    """Where "from now on" begins for one shared drive."""
+    svc = svc or service()
+    resp = svc.changes().getStartPageToken(driveId=drive_id, supportsAllDrives=True).execute()
+    return resp["startPageToken"]
+
+
+def watch_changes(drive_id: str, page_token: str, channel_id: str, address: str,
+                  token: str, expiration_ms: int, svc=None) -> dict:
+    """
+    Open a push channel: Drive POSTs to `address` whenever something in the
+    drive changes. The POST carries no file details, only the channel id and
+    `token` in headers - the receiver then asks list_changes() what happened.
+    """
+    svc = svc or service()
+    body = {
+        "id": channel_id,
+        "type": "web_hook",
+        "address": address,
+        "token": token,
+        "expiration": str(int(expiration_ms)),
+    }
+    return (
+        svc.changes()
+        .watch(
+            pageToken=page_token,
+            driveId=drive_id,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            body=body,
+        )
+        .execute()
+    )
+
+
+def stop_channel(channel_id: str, resource_id: str, svc=None) -> None:
+    svc = svc or service()
+    svc.channels().stop(body={"id": channel_id, "resourceId": resource_id}).execute()
+
+
+def list_changes(drive_id: str, page_token: str, svc=None, max_pages: int = 20) -> tuple[list[dict], str, bool]:
+    """
+    Every change since page_token. Returns (changes, token to resume from,
+    complete). complete is False when max_pages ran out first; the returned
+    token then resumes where this stopped rather than skipping ahead.
+    """
+    svc = svc or service()
+    out: list[dict] = []
+    token = page_token
+    for _ in range(max_pages):
+        resp = (
+            svc.changes()
+            .list(
+                pageToken=token,
+                driveId=drive_id,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                includeRemoved=True,
+                pageSize=1000,
+                fields=CHANGE_FIELDS,
+            )
+            .execute()
+        )
+        out.extend(resp.get("changes", []))
+        if resp.get("newStartPageToken"):
+            return out, resp["newStartPageToken"], True
+        token = resp.get("nextPageToken")
+        if not token:
+            return out, page_token, True
+    return out, token, False
+
+
+def parents_of(file_id: str, svc=None) -> list[str]:
+    svc = svc or service()
+    meta = svc.files().get(fileId=file_id, fields="id, parents", supportsAllDrives=True).execute()
+    return meta.get("parents", []) or []
+
+
+def ancestors(parents: list[str], svc=None, cache: dict | None = None, limit: int = 12) -> list[str]:
+    """
+    Every folder above a file, nearest first, up to the drive root. `cache`
+    maps folder id -> its parents and is shared across one batch of changes,
+    because six click tracks in one folder share every ancestor.
+    """
+    svc = svc or service()
+    cache = cache if cache is not None else {}
+    out: list[str] = []
+    frontier = list(parents or [])
+    while frontier and len(out) < limit * 4:
+        current = frontier.pop(0)
+        if current in out:
+            continue
+        out.append(current)
+        if current not in cache:
+            try:
+                cache[current] = parents_of(current, svc)
+            except Exception:  # noqa: BLE001 - the drive root and unreadable folders end the walk
+                cache[current] = []
+        frontier.extend(cache[current])
+    return out
